@@ -225,7 +225,7 @@ static inline void virtblk_request_done(struct request *req)
 	blk_mq_end_request(req, virtblk_result(vbr));
 }
 
-static void virtblk_done(struct virtqueue *vq)
+static int _virtblk_done(struct virtqueue *vq)
 {
 	struct virtio_blk *vblk = vq->vdev->priv;
 	bool req_done = false;
@@ -251,6 +251,54 @@ static void virtblk_done(struct virtqueue *vq)
 	if (req_done)
 		blk_mq_start_stopped_hw_queues(vblk->disk->queue, true);
 	spin_unlock_irqrestore(&vblk->vqs[qid].lock, flags);
+
+	return req_done;
+}
+
+static void virtblk_done(struct virtqueue *vq)
+{
+	_virtblk_done(vq);
+}
+
+static int virtio_poll(struct blk_mq_hw_ctx *hctx)
+{
+	struct virtio_blk *vblk = hctx->queue->queuedata;
+	struct virtio_blk_vq *blk_vq = &vblk->vqs[hctx->queue_num];
+	struct virtqueue *vq = blk_vq->vq;
+	bool req_done = false;
+	int qid = vq->index;
+	struct virtblk_req *vbr;
+	unsigned long flags;
+	unsigned int len, items = 0;
+
+	spin_lock_irqsave(&vblk->vqs[qid].lock, flags);
+
+retry:
+	virtqueue_disable_cb(vq);
+	while ((vbr = virtqueue_get_buf(vblk->vqs[qid].vq, &len)) != NULL) {
+		struct request *req = blk_mq_rq_from_pdu(vbr);
+
+		virtblk_request_done(req);
+		req_done = true;
+		items++;
+	}
+
+	/* In case queue is stopped waiting for more buffers. */
+	if (req_done) {
+		pr_debug("%d items found on vq %p", items, vq);
+		if (!virtqueue_enable_cb(vq)) {
+			pr_debug("retrying %p", vq);
+			items = 0;
+			goto retry;
+		}
+		blk_mq_start_stopped_hw_queues(vblk->disk->queue, true);
+	} else {
+		pr_debug("nothing on vq %p", vq);
+	}
+
+	spin_unlock_irqrestore(&vblk->vqs[qid].lock, flags);
+
+	return req_done;
 }
 
 static void virtio_commit_rqs(struct blk_mq_hw_ctx *hctx)
@@ -690,8 +738,13 @@ static int virtblk_init_request(struct blk_mq_tag_set *set, struct request *rq,
 static int virtblk_map_queues(struct blk_mq_tag_set *set)
 {
 	struct virtio_blk *vblk = set->driver_data;
+	int i;
 
-	return blk_mq_virtio_map_queues(&set->map[0], vblk->vdev, 0);
+	for (i = 0; i < set->nr_maps; i++) {
+		blk_mq_virtio_map_queues(&set->map[i], vblk->vdev, 0);
+	}
+
+	return 0;
 }
 
 #ifdef CONFIG_VIRTIO_BLK_SCSI
@@ -712,6 +765,7 @@ static const struct blk_mq_ops virtio_mq_ops = {
 	.initialize_rq_fn = virtblk_initialize_rq,
 #endif
 	.map_queues	= virtblk_map_queues,
+	.poll = virtio_poll,
 };
 
 static unsigned int virtblk_queue_depth;
@@ -790,6 +844,7 @@ static int virtblk_probe(struct virtio_device *vdev)
 		sizeof(struct scatterlist) * sg_elems;
 	vblk->tag_set.driver_data = vblk;
 	vblk->tag_set.nr_hw_queues = vblk->num_vqs;
+	vblk->tag_set.nr_maps = 3; /* default + read + poll */
 
 	err = blk_mq_alloc_tag_set(&vblk->tag_set);
 	if (err)
