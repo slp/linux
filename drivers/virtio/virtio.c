@@ -180,12 +180,6 @@ static int virtio_features_ok(struct virtio_device *dev)
 				 "device must provide VIRTIO_F_VERSION_1\n");
 			return -ENODEV;
 		}
-
-		if (!virtio_has_feature(dev, VIRTIO_F_ACCESS_PLATFORM)) {
-			dev_warn(&dev->dev,
-				 "device must provide VIRTIO_F_ACCESS_PLATFORM\n");
-			return -ENODEV;
-		}
 	}
 
 	if (!virtio_has_feature(dev, VIRTIO_F_VERSION_1))
