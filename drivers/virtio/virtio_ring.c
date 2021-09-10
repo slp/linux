@@ -6,6 +6,7 @@
 #include <linux/virtio.h>
 #include <linux/virtio_ring.h>
 #include <linux/virtio_config.h>
+#include <linux/virtio_anchor.h>
 #include <linux/device.h>
 #include <linux/slab.h>
 #include <linux/module.h>
@@ -268,6 +269,9 @@ static inline bool virtqueue_use_indirect(struct vring_virtqueue *vq,
 static bool vring_use_dma_api(struct virtio_device *vdev)
 {
 	if (!virtio_has_dma_quirk(vdev))
+		return true;
+
+	if (virtio_check_mem_acc_cb(vdev))
 		return true;
 
 	/* Otherwise, we are left to guess. */
