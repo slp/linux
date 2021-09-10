@@ -248,6 +248,9 @@ static bool vring_use_dma_api(struct virtio_device *vdev)
 	if (!virtio_has_dma_quirk(vdev))
 		return true;
 
+	if (platform_has(PLATFORM_VIRTIO_RESTRICTED_MEM_ACCESS))
+		return true;
+
 	/* Otherwise, we are left to guess. */
 	/*
 	 * In theory, it's possible to have a buggy QEMU-supposed
