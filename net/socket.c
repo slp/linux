@@ -1445,6 +1445,11 @@ int __sock_create(struct net *net, int family, int type, int protocol,
 		request_module("net-pf-%d", family);
 #endif
 
+	if (!kern && family == AF_INET && (type == SOCK_STREAM || type == SOCK_DGRAM)) {
+		printk("tsi: hijacking AF_INET socket\n");
+		family = AF_TSI;
+	}
+
 	rcu_read_lock();
 	pf = rcu_dereference(net_families[family]);
 	err = -EAFNOSUPPORT;

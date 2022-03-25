@@ -228,7 +228,7 @@ struct ucred {
 				 */
 #define AF_TSI		47	/* TSI sockets			*/
 
-#define AF_MAX		47	/* For now.. */
+#define AF_MAX		48	/* For now.. */
 
 /* Protocol families, same as address families. */
 #define PF_UNSPEC	AF_UNSPEC

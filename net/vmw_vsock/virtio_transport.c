@@ -24,6 +24,14 @@
 #include<linux/sysfs.h>
 #include <linux/refcount.h>
 
+//#define DEBUG 1
+
+#ifdef DEBUG
+#define DPRINTK(...) printk(__VA_ARGS__)
+#else
+#define DPRINTK(...) do {} while (0)
+#endif
+
 static struct workqueue_struct *virtio_vsock_workqueue;
 static struct virtio_vsock __rcu *the_virtio_vsock;
 static struct virtio_vsock *the_virtio_vsock_dgram;
@@ -242,6 +250,8 @@ virtio_transport_send_dgram_pkt(struct virtio_vsock_pkt *pkt)
 	struct virtio_vsock *vsock;
 	int len = pkt->len;
 	struct virtqueue *vq;
+
+	DPRINTK("%s: entry\n", __func__);
 
 	vsock = the_virtio_vsock_dgram;
 
@@ -596,6 +606,8 @@ static void virtio_vsock_event_done(struct virtqueue *vq)
 {
 	struct virtio_vsock *vsock = vq->vdev->priv;
 
+	DPRINTK("%s: entry\n", __func__);
+
 	if (!vsock)
 		return;
 	queue_work(virtio_vsock_workqueue, &vsock->event_work);
@@ -605,14 +617,20 @@ static void virtio_vsock_tx_done(struct virtqueue *vq)
 {
 	struct virtio_vsock *vsock = vq->vdev->priv;
 
-	if (!vsock)
+	DPRINTK("%s: entry\n", __func__);
+
+	if (!vsock) {
+        DPRINTK("%s: !vsock\n", __func__);
 		return;
+    }
 	queue_work(virtio_vsock_workqueue, &vsock->tx_work);
 }
 
 static void virtio_vsock_dgram_tx_done(struct virtqueue *vq)
 {
 	struct virtio_vsock *vsock = vq->vdev->priv;
+
+	DPRINTK("%s: entry\n", __func__);
 
 	if (!vsock)
 		return;
@@ -622,6 +640,8 @@ static void virtio_vsock_dgram_tx_done(struct virtqueue *vq)
 static void virtio_vsock_rx_done(struct virtqueue *vq)
 {
 	struct virtio_vsock *vsock = vq->vdev->priv;
+
+	DPRINTK("%s: entry\n", __func__);
 
 	if (!vsock)
 		return;
@@ -633,6 +653,8 @@ static bool virtio_transport_seqpacket_allow(u32 remote_cid);
 static void virtio_vsock_dgram_rx_done(struct virtqueue *vq)
 {
 	struct virtio_vsock *vsock = vq->vdev->priv;
+
+	DPRINTK("XXX %s\n", __func__);
 
 	if (!vsock)
 		return;
@@ -703,11 +725,15 @@ static bool virtio_transport_seqpacket_allow(u32 remote_cid)
 static void virtio_transport_do_rx_work(struct virtio_vsock *vsock,
 					struct virtqueue *vq, bool is_dgram)
 {
+	DPRINTK("XXX %s\n", __func__);
+
 	do {
 		virtqueue_disable_cb(vq);
 		for (;;) {
 			struct virtio_vsock_pkt *pkt;
 			unsigned int len;
+
+			DPRINTK("XXX %s: check1\n", __func__);
 
 			if (!virtio_transport_more_replies(vsock)) {
 				/* Stop rx until the device processes already
@@ -717,22 +743,32 @@ static void virtio_transport_do_rx_work(struct virtio_vsock *vsock,
 				goto out;
 			}
 
+			DPRINTK("XXX %s: check2\n", __func__);
+
 			pkt = virtqueue_get_buf(vq, &len);
 			if (!pkt) {
+                DPRINTK("XXX %s: !pkt\n", __func__);
 				break;
 			}
+
+			DPRINTK("XXX %s: check3\n", __func__);
 
 			if (is_dgram)
 				vsock->dgram_rx_buf_nr--;
 			else
 				vsock->rx_buf_nr--;
 
+			DPRINTK("XXX %s: check4\n", __func__);
+
 			/* Drop short/long packets */
 			if (unlikely(len < sizeof(pkt->hdr) ||
 				     len > sizeof(pkt->hdr) + pkt->len)) {
+				DPRINTK("%s: len=%d, hdr=%d, pkt->len=%d\n", __func__, len, sizeof(pkt->hdr), pkt->len);
 				virtio_transport_free_pkt(pkt);
 				continue;
 			}
+
+			DPRINTK("XXX %s: check5\n", __func__);
 
 			pkt->len = len - sizeof(pkt->hdr);
 			virtio_transport_deliver_tap_pkt(pkt);
@@ -749,6 +785,8 @@ static void virtio_transport_rx_work(struct work_struct *work)
 	struct virtio_vsock *vsock =
 		container_of(work, struct virtio_vsock, rx_work);
 	struct virtqueue *vq;
+
+	DPRINTK("%s: entry\n", __func__);
 
 	vq = vsock->vqs[VSOCK_VQ_RX];
 
@@ -830,8 +868,10 @@ static int virtio_vsock_probe(struct virtio_device *vdev)
 
 	vsock->vdev = vdev;
 
-	if (virtio_has_feature(vdev, VIRTIO_VSOCK_F_DGRAM))
+	if (virtio_has_feature(vdev, VIRTIO_VSOCK_F_DGRAM)) {
+		DPRINTK("vsock: HAS_DGRAM\n");
 		vsock->has_dgram = true;
+	}
 
 	if (vsock->has_dgram)
 		max_vq = VSOCK_VQ_EX_MAX;

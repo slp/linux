@@ -110,6 +110,14 @@
 #include <net/sock.h>
 #include <net/af_vsock.h>
 
+//#define DEBUG 1
+
+#ifdef DEBUG
+#define DPRINTK(...) printk(__VA_ARGS__)
+#else
+#define DPRINTK(...) do {} while (0)
+#endif
+
 static int __vsock_bind(struct sock *sk, struct sockaddr_vm *addr);
 static void vsock_sk_destruct(struct sock *sk);
 static int vsock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb);
@@ -203,6 +211,7 @@ static void vsock_init_tables(void)
 static void __vsock_insert_bound(struct list_head *list,
 				 struct vsock_sock *vsk)
 {
+	DPRINTK("%s: inserting bound socket\n", __func__);
 	sock_hold(&vsk->sk);
 	list_add(&vsk->bound_table, list);
 }
@@ -216,6 +225,7 @@ static void __vsock_insert_connected(struct list_head *list,
 
 static void __vsock_remove_bound(struct vsock_sock *vsk)
 {
+	DPRINTK("%s: remove bound socket\n", __func__);
 	list_del_init(&vsk->bound_table);
 	sock_put(&vsk->sk);
 }
@@ -230,7 +240,11 @@ static struct sock *__vsock_find_bound_socket(struct sockaddr_vm *addr)
 {
 	struct vsock_sock *vsk;
 
+	DPRINTK("%s: entry\n", __func__);
+
+	DPRINTK("%s: svm_port=%d\n", __func__, addr->svm_port);
 	list_for_each_entry(vsk, vsock_bound_sockets(addr), bound_table) {
+		DPRINTK("%s: svm_port=%d svm_cid=%d\n", __func__, addr->svm_port, addr->svm_cid);
 		if (vsock_addr_equals_addr(addr, &vsk->local_addr))
 			return sk_vsock(vsk);
 
@@ -664,6 +678,7 @@ static int __vsock_bind_connectible(struct vsock_sock *vsk,
 	 * by AF_UNIX.
 	 */
 	__vsock_remove_bound(vsk);
+	DPRINTK("%s: svm_port=%d\n", __func__, vsk->local_addr.svm_port);
 	__vsock_insert_bound(vsock_bound_sockets(&vsk->local_addr), vsk);
 
 	return 0;
@@ -1020,7 +1035,9 @@ static __poll_t vsock_poll(struct file *file, struct socket *sock,
 	sk = sock->sk;
 	vsk = vsock_sk(sk);
 
+	DPRINTK("%s: waiting data for %p\n", __func__, sk);
 	poll_wait(file, sk_sleep(sk), wait);
+	DPRINTK("%s: stopped waiting for %p\n", __func__, sk);
 	mask = 0;
 
 	if (sk->sk_err)
@@ -1046,13 +1063,31 @@ static __poll_t vsock_poll(struct file *file, struct socket *sock,
 		 * the queue and write as long as the socket isn't shutdown for
 		 * sending.
 		 */
-		if (!skb_queue_empty_lockless(&sk->sk_receive_queue) ||
-		    (sk->sk_shutdown & RCV_SHUTDOWN)) {
+		bool data_ready_now = false;
+		const struct vsock_transport *transport;
+
+		lock_sock(sk);
+		transport = vsk->transport;
+		if (transport) {
+			int ret = transport->notify_poll_in(
+				vsk, 1, &data_ready_now);
+
+			if (ret < 0) {
+				mask |= EPOLLERR;
+			}
+		}
+		release_sock(sk);
+
+		DPRINTK("%s: DGRAM\n", __func__);
+		if (data_ready_now || (sk->sk_shutdown & RCV_SHUTDOWN)) {
+			DPRINTK("%s: something to read\n", __func__);
 			mask |= EPOLLIN | EPOLLRDNORM;
 		}
 
-		if (!(sk->sk_shutdown & SEND_SHUTDOWN))
+		if (!(sk->sk_shutdown & SEND_SHUTDOWN)) {
+			DPRINTK("%s: can write\n", __func__);
 			mask |= EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND;
+		}
 
 	} else if (sock_type_connectible(sk->sk_type)) {
 		const struct vsock_transport *transport;
@@ -1094,6 +1129,7 @@ static __poll_t vsock_poll(struct file *file, struct socket *sock,
 
 		/* Connected sockets that can produce data can be written. */
 		if (transport && sk->sk_state == TCP_ESTABLISHED) {
+			DPRINTK("%s: established\n", __func__);
 			if (!(sk->sk_shutdown & SEND_SHUTDOWN)) {
 				bool space_avail_now = false;
 				int ret = transport->notify_poll_out(
@@ -1101,12 +1137,15 @@ static __poll_t vsock_poll(struct file *file, struct socket *sock,
 				if (ret < 0) {
 					mask |= EPOLLERR;
 				} else {
-					if (space_avail_now)
+					if (space_avail_now) {
+                        DPRINTK("%s: space avail\n", __func__);
 						/* Remove EPOLLWRBAND since INET
 						 * sockets are not setting it.
 						 */
 						mask |= EPOLLOUT | EPOLLWRNORM;
-
+                    } else {
+                        DPRINTK("%s: no space avail\n", __func__);
+                    }
 				}
 			}
 		}
@@ -1135,6 +1174,8 @@ static int vsock_dgram_sendmsg(struct socket *sock, struct msghdr *msg,
 	struct vsock_sock *vsk;
 	struct sockaddr_vm *remote_addr;
 	const struct vsock_transport *transport;
+
+	DPRINTK("%s: entry\n", __func__);
 
 	if (msg->msg_flags & MSG_OOB)
 		return -EOPNOTSUPP;
@@ -1167,6 +1208,7 @@ static int vsock_dgram_sendmsg(struct socket *sock, struct msghdr *msg,
 			remote_addr->svm_cid = transport->get_local_cid();
 
 		if (!vsock_addr_bound(remote_addr)) {
+            DPRINTK("%s: check1\n", __func__);
 			err = -EINVAL;
 			goto out;
 		}
@@ -1180,16 +1222,19 @@ static int vsock_dgram_sendmsg(struct socket *sock, struct msghdr *msg,
 		 * bound?
 		 */
 		if (!vsock_addr_bound(&vsk->remote_addr)) {
+            DPRINTK("%s: check2\n", __func__);
 			err = -EINVAL;
 			goto out;
 		}
 	} else {
+        DPRINTK("%s: check3\n", __func__);
 		err = -EINVAL;
 		goto out;
 	}
 
 	if (!transport->dgram_allow(remote_addr->svm_cid,
 				    remote_addr->svm_port)) {
+        DPRINTK("%s: check4\n", __func__);
 		err = -EINVAL;
 		goto out;
 	}
@@ -1247,6 +1292,8 @@ static int vsock_dgram_recvmsg(struct socket *sock, struct msghdr *msg,
 			       size_t len, int flags)
 {
 	struct vsock_sock *vsk = vsock_sk(sock->sk);
+
+	DPRINTK("%s: entry\n", __func__);
 
 	return vsk->transport->dgram_dequeue(vsk, msg, len, flags);
 }

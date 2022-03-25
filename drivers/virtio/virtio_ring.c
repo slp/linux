@@ -2147,7 +2147,9 @@ irqreturn_t vring_interrupt(int irq, void *_vq)
 	struct vring_virtqueue *vq = to_vvq(_vq);
 
 	if (!more_used(vq)) {
-		pr_debug("virtqueue interrupt with no work for %p\n", vq);
+		if (irq == 8) {
+			//printk("virtqueue interrupt with no work for %p\n", vq);
+		}
 		return IRQ_NONE;
 	}
 
@@ -2158,7 +2160,9 @@ irqreturn_t vring_interrupt(int irq, void *_vq)
 	if (vq->event)
 		vq->event_triggered = true;
 
-	pr_debug("virtqueue callback for %p (%p)\n", vq, vq->vq.callback);
+	if (irq == 8) {
+		//printk("virtqueue callback for %p (%p)\n", vq, vq->vq.callback);
+    }
 	if (vq->vq.callback)
 		vq->vq.callback(&vq->vq);
 

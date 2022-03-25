@@ -288,16 +288,24 @@ static irqreturn_t vm_interrupt(int irq, void *opaque)
 	unsigned long flags;
 	irqreturn_t ret = IRQ_NONE;
 
+	//if (irq == 8)
+	//	printk("virtio-mmio: irq=%d\n", irq);
+
 	/* Read and acknowledge interrupts */
 	status = readl(vm_dev->base + VIRTIO_MMIO_INTERRUPT_STATUS);
 	writel(status, vm_dev->base + VIRTIO_MMIO_INTERRUPT_ACK);
 
 	if (unlikely(status & VIRTIO_MMIO_INT_CONFIG)) {
+		//if (irq == 8)
+		//	printk("virtio-mmio: IGNORING irq=%d\n", irq);
+
 		virtio_config_changed(&vm_dev->vdev);
 		ret = IRQ_HANDLED;
 	}
 
 	if (likely(status & VIRTIO_MMIO_INT_VRING)) {
+		//if (irq == 8)
+		//	printk("virtio-mmio: WORKING irq=%d\n", irq);
 		spin_lock_irqsave(&vm_dev->lock, flags);
 		list_for_each_entry(info, &vm_dev->virtqueues, node)
 			ret |= vring_interrupt(irq, info->vq);

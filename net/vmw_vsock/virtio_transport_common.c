@@ -20,6 +20,14 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/vsock_virtio_transport_common.h>
 
+//#define DEBUG 1
+
+#ifdef DEBUG
+#define DPRINTK(...) printk(__VA_ARGS__)
+#else
+#define DPRINTK(...) do {} while (0)
+#endif
+
 /* How long to wait for graceful shutdown of a connection */
 #define VSOCK_CLOSE_TIMEOUT (8 * HZ)
 
@@ -179,8 +187,10 @@ static u16 virtio_transport_get_type(struct sock *sk)
 {
 	if (sk->sk_type == SOCK_STREAM)
 		return VIRTIO_VSOCK_TYPE_STREAM;
-	else
+	else if (sk->sk_type == SOCK_SEQPACKET)
 		return VIRTIO_VSOCK_TYPE_SEQPACKET;
+	else
+		return VIRTIO_VSOCK_TYPE_DGRAM;
 }
 
 /* This function can only be used on connecting/connected sockets,
@@ -240,6 +250,8 @@ static int virtio_transport_send_pkt_info(struct vsock_sock *vsk,
 			virtio_transport_put_credit(vvs, pkt_len);
 		return -ENOMEM;
 	}
+
+	DPRINTK("%s: pkt->hdr.type=%d\n", __func__, pkt->hdr.type);
 
 	virtio_transport_inc_tx_pkt(vvs, pkt);
 
@@ -499,6 +511,8 @@ virtio_transport_dgram_do_dequeue(struct vsock_sock *vsk,
 	size_t total = 0;
 	int err = -EFAULT;
 
+	DPRINTK("%s: entry\n", __func__);
+
 	spin_lock_bh(&vvs->rx_lock);
 	if (total < len && !list_empty(&vvs->rx_queue)) {
 		pkt = list_first_entry(&vvs->rx_queue,
@@ -592,6 +606,8 @@ virtio_transport_dgram_dequeue(struct vsock_sock *vsk,
 	size_t err = 0;
 	long timeout;
 
+	DPRINTK("%s: entry\n", __func__);
+
 	DEFINE_WAIT(wait);
 
 	sk = &vsk->sk;
@@ -605,15 +621,20 @@ virtio_transport_dgram_dequeue(struct vsock_sock *vsk,
 	if (!len)
 		goto out;
 
+	DPRINTK("%s: check1\n", __func__);
+
 	timeout = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
 
 	while (1) {
 		s64 ready;
 
+		DPRINTK("%s: check2\n", __func__);
+
 		prepare_to_wait(sk_sleep(sk), &wait, TASK_INTERRUPTIBLE);
 		ready = virtio_transport_dgram_has_data(vsk);
 
 		if (ready == 0) {
+			DPRINTK("%s: check3\n", __func__);
 			if (timeout == 0) {
 				err = -EAGAIN;
 				finish_wait(sk_sleep(sk), &wait);
@@ -634,6 +655,7 @@ virtio_transport_dgram_dequeue(struct vsock_sock *vsk,
 				break;
 			}
 		} else {
+			DPRINTK("%s: check4\n", __func__);
 			finish_wait(sk_sleep(sk), &wait);
 
 			if (ready < 0) {
@@ -646,6 +668,7 @@ virtio_transport_dgram_dequeue(struct vsock_sock *vsk,
 		}
 	}
 out:
+	DPRINTK("%s: check5\n", __func__);
 	release_sock(sk);
 	return err;
 }
@@ -687,7 +710,9 @@ static s64 virtio_transport_has_space(struct vsock_sock *vsk)
 	struct virtio_vsock_sock *vvs = vsk->trans;
 	s64 bytes;
 
+    DPRINTK("%s: peer_buf_alloc=%d, tx_cnt=%d, peer_fwd_cnt=%d\n", __func__, vvs->peer_buf_alloc, vvs->tx_cnt, vvs->peer_fwd_cnt);
 	bytes = vvs->peer_buf_alloc - (vvs->tx_cnt - vvs->peer_fwd_cnt);
+    DPRINTK("%s: bytes=%d\n", __func__, bytes);
 	if (bytes < 0)
 		bytes = 0;
 
@@ -914,6 +939,8 @@ virtio_transport_dgram_enqueue(struct vsock_sock *vsk,
 		.remote_port = remote_addr->svm_port,
 	};
 
+	DPRINTK("%s: entry\n", __func__);
+
 	return virtio_transport_send_pkt_info(vsk, &info);
 }
 EXPORT_SYMBOL_GPL(virtio_transport_dgram_enqueue);
@@ -951,6 +978,8 @@ static int virtio_transport_reset(struct vsock_sock *vsk,
 		.vsk = vsk,
 	};
 
+	DPRINTK("%s: XXX\n", __func__);
+
 	/* Send RST only if the original pkt is not a RST pkt */
 	if (pkt && le16_to_cpu(pkt->hdr.op) == VIRTIO_VSOCK_OP_RST)
 		return 0;
@@ -970,6 +999,8 @@ static int virtio_transport_reset_no_sock(const struct virtio_transport *t,
 		.type = le16_to_cpu(pkt->hdr.type),
 		.reply = true,
 	};
+
+	DPRINTK("%s: XXX\n", __func__);
 
 	/* Send RST only if the original pkt is not a RST pkt */
 	if (le16_to_cpu(pkt->hdr.op) == VIRTIO_VSOCK_OP_RST)
@@ -1125,18 +1156,22 @@ virtio_transport_recv_connecting(struct sock *sk,
 
 	switch (le16_to_cpu(pkt->hdr.op)) {
 	case VIRTIO_VSOCK_OP_RESPONSE:
+		DPRINTK("%s: response\n", __func__);
 		sk->sk_state = TCP_ESTABLISHED;
 		sk->sk_socket->state = SS_CONNECTED;
 		vsock_insert_connected(vsk);
 		sk->sk_state_change(sk);
 		break;
 	case VIRTIO_VSOCK_OP_INVALID:
+		DPRINTK("%s: invalid\n", __func__);
 		break;
 	case VIRTIO_VSOCK_OP_RST:
+		DPRINTK("%s: rst\n", __func__);
 		skerr = ECONNRESET;
 		err = 0;
 		goto destroy;
 	default:
+		DPRINTK("%s: default\n", __func__);
 		skerr = EPROTO;
 		err = -EINVAL;
 		goto destroy;
@@ -1158,6 +1193,8 @@ virtio_transport_recv_enqueue(struct vsock_sock *vsk,
 	struct virtio_vsock_sock *vvs = vsk->trans;
 	bool can_enqueue, free_pkt = false;
 
+	DPRINTK("%s: entry\n", __func__);
+
 	pkt->len = le32_to_cpu(pkt->hdr.len);
 	pkt->off = 0;
 
@@ -1168,6 +1205,8 @@ virtio_transport_recv_enqueue(struct vsock_sock *vsk,
 		free_pkt = true;
 		goto out;
 	}
+
+	DPRINTK("%s: check1\n", __func__);
 
 	if (le32_to_cpu(pkt->hdr.flags) & VIRTIO_VSOCK_SEQ_EOM)
 		vvs->msg_count++;
@@ -1200,6 +1239,8 @@ virtio_transport_recv_enqueue(struct vsock_sock *vsk,
 		}
 	}
 
+	DPRINTK("%s: check2\n", __func__);
+
 	list_add_tail(&pkt->list, &vvs->rx_queue);
 
 out:
@@ -1216,7 +1257,9 @@ virtio_transport_recv_connected(struct sock *sk,
 	int err = 0;
 
 	if (le16_to_cpu(pkt->hdr.type) == VIRTIO_VSOCK_TYPE_DGRAM) {
+		DPRINTK("%s: DGRAM\n", __func__);
 		virtio_transport_recv_enqueue(vsk, pkt);
+		DPRINTK("%s: data ready for %p\n", __func__, sk);
 		sk->sk_data_ready(sk);
 		return err;
 	}
@@ -1227,6 +1270,7 @@ virtio_transport_recv_connected(struct sock *sk,
 		sk->sk_data_ready(sk);
 		return err;
 	case VIRTIO_VSOCK_OP_CREDIT_REQUEST:
+        printk("%s: send_credit_update\n", __func__);
 		virtio_transport_send_credit_update(vsk);
 		break;
 	case VIRTIO_VSOCK_OP_CREDIT_UPDATE:
@@ -1388,6 +1432,8 @@ void virtio_transport_recv_pkt(struct virtio_transport *t,
 	struct sock *sk;
 	bool space_available;
 
+	DPRINTK("%s: entry\n", __func__);
+
 	vsock_addr_init(&src, le64_to_cpu(pkt->hdr.src_cid),
 			le32_to_cpu(pkt->hdr.src_port));
 	vsock_addr_init(&dst, le64_to_cpu(pkt->hdr.dst_cid),
@@ -1407,6 +1453,8 @@ void virtio_transport_recv_pkt(struct virtio_transport *t,
 		goto free_pkt;
 	}
 
+	DPRINTK("%s: check1\n", __func__);
+
 	/* The socket must be in connected or bound table
 	 * otherwise send reset back
 	 */
@@ -1419,11 +1467,15 @@ void virtio_transport_recv_pkt(struct virtio_transport *t,
 		}
 	}
 
+	DPRINTK("%s: check2\n", __func__);
+
 	if (virtio_transport_get_type(sk) != le16_to_cpu(pkt->hdr.type)) {
 		(void)virtio_transport_reset_no_sock(t, pkt);
 		sock_put(sk);
 		goto free_pkt;
 	}
+
+	DPRINTK("%s: check3\n", __func__);
 
 	vsk = vsock_sk(sk);
 
@@ -1437,10 +1489,13 @@ void virtio_transport_recv_pkt(struct virtio_transport *t,
 		goto free_pkt;
 	}
 
+	DPRINTK("%s: check4\n", __func__);
+
 	/* Update CID in case it has changed after a transport reset event */
 	vsk->local_addr.svm_cid = dst.svm_cid;
 
 	if (sk->sk_type == SOCK_DGRAM) {
+		DPRINTK("%s: DGRAM\n", __func__);
 		virtio_transport_recv_connected(sk, pkt);
 		goto out;
 	}
@@ -1452,17 +1507,21 @@ void virtio_transport_recv_pkt(struct virtio_transport *t,
 
 	switch (sk->sk_state) {
 	case TCP_LISTEN:
+		DPRINTK("%s: check listen\n", __func__);
 		virtio_transport_recv_listen(sk, pkt, t);
 		virtio_transport_free_pkt(pkt);
 		break;
 	case TCP_SYN_SENT:
+		DPRINTK("%s: syn sent\n", __func__);
 		virtio_transport_recv_connecting(sk, pkt);
 		virtio_transport_free_pkt(pkt);
 		break;
 	case TCP_ESTABLISHED:
+		DPRINTK("%s: esta\n", __func__);
 		virtio_transport_recv_connected(sk, pkt);
 		break;
 	case TCP_CLOSING:
+		DPRINTK("%s: closing\n", __func__);
 		virtio_transport_recv_disconnecting(sk, pkt);
 		virtio_transport_free_pkt(pkt);
 		break;
