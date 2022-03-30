@@ -20,7 +20,7 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/vsock_virtio_transport_common.h>
 
-//#define DEBUG 1
+#define DEBUG 1
 
 #ifdef DEBUG
 #define DPRINTK(...) printk(__VA_ARGS__)
@@ -1363,17 +1363,20 @@ virtio_transport_recv_listen(struct sock *sk, struct virtio_vsock_pkt *pkt,
 	int ret;
 
 	if (le16_to_cpu(pkt->hdr.op) != VIRTIO_VSOCK_OP_REQUEST) {
+        DPRINTK("%s: check1\n", __func__);
 		virtio_transport_reset_no_sock(t, pkt);
 		return -EINVAL;
 	}
 
 	if (sk_acceptq_is_full(sk)) {
+        DPRINTK("%s: check2\n", __func__);
 		virtio_transport_reset_no_sock(t, pkt);
 		return -ENOMEM;
 	}
 
 	child = vsock_create_connected(sk);
 	if (!child) {
+        DPRINTK("%s: check3\n", __func__);
 		virtio_transport_reset_no_sock(t, pkt);
 		return -ENOMEM;
 	}
@@ -1395,6 +1398,7 @@ virtio_transport_recv_listen(struct sock *sk, struct virtio_vsock_pkt *pkt,
 	 * where we received the request.
 	 */
 	if (ret || vchild->transport != &t->transport) {
+        DPRINTK("%s: check4: ret=%d\n", __func__, ret);
 		release_sock(child);
 		virtio_transport_reset_no_sock(t, pkt);
 		sock_put(child);
@@ -1404,6 +1408,7 @@ virtio_transport_recv_listen(struct sock *sk, struct virtio_vsock_pkt *pkt,
 	if (virtio_transport_space_update(child, pkt))
 		child->sk_write_space(child);
 
+    DPRINTK("%s: insert connected\n", __func__);
 	vsock_insert_connected(vchild);
 	vsock_enqueue_accept(sk, child);
 	virtio_transport_send_response(vchild, pkt);

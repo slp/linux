@@ -110,7 +110,7 @@
 #include <net/sock.h>
 #include <net/af_vsock.h>
 
-//#define DEBUG 1
+#define DEBUG 1
 
 #ifdef DEBUG
 #define DPRINTK(...) printk(__VA_ARGS__)
@@ -262,8 +262,14 @@ static struct sock *__vsock_find_connected_socket(struct sockaddr_vm *src,
 {
 	struct vsock_sock *vsk;
 
+	DPRINTK("%s: entry\n", __func__);
+
+	DPRINTK("%s: src->svm_port=%u, dst->svm_port=%u\n", __func__, src->svm_port, dst->svm_port);
+
 	list_for_each_entry(vsk, vsock_connected_sockets(src, dst),
 			    connected_table) {
+        DPRINTK("%s: src->svm_port=%u, vsk->remote_addr.svm_port=%u\n", __func__, src->svm_port, vsk->remote_addr.svm_port);
+        DPRINTK("%s: dst->svm_port=%u, vsk->local_addr.svm_port=%u\n", __func__, dst->svm_port, vsk->local_addr.svm_port);
 		if (vsock_addr_equals_addr(src, &vsk->remote_addr) &&
 		    dst->svm_port == vsk->local_addr.svm_port) {
 			return sk_vsock(vsk);
@@ -463,17 +469,25 @@ int vsock_assign_transport(struct vsock_sock *vsk, struct vsock_sock *psk)
 
 	switch (sk->sk_type) {
 	case SOCK_DGRAM:
+        DPRINTK("%s: dgram\n", __func__);
 		new_transport = transport_dgram;
 		break;
 	case SOCK_STREAM:
 	case SOCK_SEQPACKET:
-		if (vsock_use_local_transport(remote_cid))
+        DPRINTK("%s: stream/seqpacket\n", __func__);
+		if (vsock_use_local_transport(remote_cid)) {
+            DPRINTK("%s local\n", __func__);
 			new_transport = transport_local;
+        }
 		else if (remote_cid <= VMADDR_CID_HOST || !transport_h2g ||
-			 (remote_flags & VMADDR_FLAG_TO_HOST))
+                 (remote_flags & VMADDR_FLAG_TO_HOST)) {
+            DPRINTK("%s g2h\n", __func__);
 			new_transport = transport_g2h;
-		else
+        }
+		else {
+            DPRINTK("%s h2g\n", __func__);
 			new_transport = transport_h2g;
+        }
 		break;
 	default:
 		return -ESOCKTNOSUPPORT;

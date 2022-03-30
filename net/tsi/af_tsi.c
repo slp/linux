@@ -3,7 +3,7 @@
 #include <net/sock.h>
 #include <net/af_vsock.h>
 
-//#define DEBUG 1
+#define DEBUG 1
 
 #ifdef DEBUG
 #define DPRINTK(...) printk(__VA_ARGS__)
@@ -19,23 +19,25 @@
 #define S_CONNECTED_INET	5
 
 #define TSI_CID 2
-#define TSI_DEFAULT_PORT  1024
+#define TSI_DEFAULT_PORT  620
 
 #define TSI_PROXY_CREATE  1024
 #define TSI_CONNECT       1025
 #define TSI_GETNAME       1026
 #define TSI_SENDTO_ADDR   1027
 #define TSI_SENDTO_DATA   1028
+#define TSI_LISTEN        1029
+#define TSI_ACCEPT        1030
 
 struct socket *control_socket = NULL;
 
 struct tsi_proxy_create {
-	u64 id;
+	u32 svm_port;
 	u16 type;
 } __attribute__((packed));
 
 struct tsi_connect_req {
-	u64 id;
+	u32 svm_port;
 	u32 addr;
 	u16 port;
 } __attribute__((packed));
@@ -45,7 +47,39 @@ struct tsi_connect_rsp {
 };
 
 struct tsi_sendto_addr {
-	u64 id;
+	u32 svm_port;
+	u32 addr;
+	u16 port;
+} __attribute__((packed));
+
+struct tsi_listen_req {
+    u32 svm_port;
+    u32 addr;
+    u16 port;
+    u32 vm_port;
+    int backlog;
+} __attribute__((packed));
+
+struct tsi_listen_rsp {
+    int result;
+};
+
+struct tsi_accept_req {
+    u32 svm_port;
+    int flags;
+} __attribute__((packed));
+
+struct tsi_accept_rsp {
+    int result;
+} __attribute__((packed));
+
+struct tsi_getname_req {
+	u32 svm_port;
+    u32 svm_peer_port;
+	u32 peer;
+} __attribute__((packed));
+
+struct tsi_getname_rsp {
 	u32 addr;
 	u16 port;
 } __attribute__((packed));
@@ -56,9 +90,10 @@ struct tsi_sock {
 	struct socket *isocket;
 	struct socket *vsocket;
 	unsigned int status;
-    uint64_t proxy_id;
-    struct sockaddr_in sin_sendto;
-    bool sendto_loaded;
+    u32 svm_port;
+    u32 svm_peer_port;
+    struct sockaddr_in *bound_addr;
+    struct sockaddr_in *sendto_addr;
 };
 
 /* Protocol family. */
@@ -160,7 +195,14 @@ static int tsi_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 	err = vsocket->ops->bind(vsocket, (struct sockaddr *)&addr_vsock, sizeof(addr_vsock));
 	if (err) {
 		DPRINTK("%s: error setting up vsock listener: %d\n", __func__, err);
-	}
+	} else if (addr_len == sizeof(struct sockaddr_in)) {
+        struct sockaddr_in *sin = (struct sockaddr_in *) addr;
+        DPRINTK("%s: port=%d\n", __func__, sin->sin_port);
+        if (!tsk->bound_addr) {
+            tsk->bound_addr = kmalloc(sizeof(struct sockaddr_in), GFP_KERNEL);
+        }
+        memcpy(tsk->bound_addr, addr, sizeof(struct sockaddr_in));
+    }
 
 	return isocket->ops->bind(isocket, addr, addr_len);
 }
@@ -194,10 +236,8 @@ static int tsi_create_proxy(struct tsi_sock *tsk, int type)
 			return err;
     }
 
-    tsk->proxy_id = vm_addr.svm_port;
-
+    tpc.svm_port = tsk->svm_port = vm_addr.svm_port;
     tpc.type = type;
-    tpc.id = vm_addr.svm_port;
 
     vm_addr.svm_port = TSI_PROXY_CREATE;
     vm_addr.svm_cid = TSI_CID;
@@ -252,13 +292,13 @@ static int tsi_stream_connect(struct socket *sock, struct sockaddr *addr,
 			.iov_len = sizeof(struct tsi_connect_req),
 		};
 
-        if (!tsk->proxy_id) {
+        if (!tsk->svm_port) {
             if (tsi_create_proxy(tsk, SOCK_STREAM) != 0) {
                 return EINVAL;
             }
         }
 
-		tc_req.id = tsk->proxy_id;
+		tc_req.svm_port = tsk->svm_port;
 		tc_req.addr = sin->sin_addr.s_addr;
 		tc_req.port = sin->sin_port;
 
@@ -314,8 +354,16 @@ static int tsi_stream_connect(struct socket *sock, struct sockaddr *addr,
 			return err;
 		}
 
+        err = vsocket->ops->getname(vsocket, (struct sockaddr *) &vm_addr, 1);
+        if (err < 0) {
+            DPRINTK("%s: error in peer getname: %d\n", __func__, err);
+			return err;
+        }
+
+        tsk->svm_peer_port = vm_addr.svm_port;
 		tsk->status = S_CONNECTED_VSOCK;
 
+        return 0;
 		/*
 		err = vsock_tsi_connect(vsocket, addr, addr_len, flags);
 		if (err == 0 || err == -EALREADY) {
@@ -370,17 +418,17 @@ static int tsi_dgram_connect(struct socket *sock, struct sockaddr *addr,
 			.iov_len = sizeof(struct tsi_connect_req),
 		};
 
-        if (!tsk->proxy_id) {
+        if (!tsk->svm_port) {
             if (tsi_create_proxy(tsk, SOCK_DGRAM) != 0) {
                 return EINVAL;
             }
         }
 
-		tc_req.id = tsk->proxy_id;
+		tc_req.svm_port = tsk->svm_port;
 		tc_req.addr = sin->sin_addr.s_addr;
 		tc_req.port = sin->sin_port;
 
-        DPRINTK("%s: sending connection request id=%llu\n", __func__, tc_req.id);
+        DPRINTK("%s: sending connection request id=%u\n", __func__, tc_req.svm_port);
 
 		memset(&vm_addr, 0, sizeof(struct sockaddr_vm));
 		vm_addr.svm_family = AF_VSOCK;
@@ -411,7 +459,7 @@ static int tsi_dgram_connect(struct socket *sock, struct sockaddr *addr,
 			return -EINVAL;
 		}
 
-		vm_addr.svm_port = tc_req.id;
+		vm_addr.svm_port = tc_req.svm_port;
 		vm_addr.svm_cid = TSI_CID;
 
 		err = kernel_connect(vsocket, (struct sockaddr *) &vm_addr, sizeof(struct sockaddr_vm), 0);
@@ -438,7 +486,7 @@ static int tsi_dgram_connect(struct socket *sock, struct sockaddr *addr,
 }
 
 
-static int tsi_accept_socket(struct socket *socket, struct socket **newsock,
+static int tsi_accept_inet(struct socket *socket, struct socket **newsock,
 			     int flags, bool kern)
 {
 	struct socket *nsock;
@@ -461,9 +509,74 @@ static int tsi_accept_socket(struct socket *socket, struct socket **newsock,
 	return err;
 }
 
+static int tsi_accept_vsock(struct tsi_sock *tsk, struct socket **newsock,
+                            int flags, bool kern)
+{
+    struct socket *socket = tsk->vsocket;
+    struct socket *nsock;
+	struct sockaddr_vm vm_addr;
+	struct msghdr msg = { .msg_flags = 0 };
+	struct tsi_accept_req ta_req;
+	struct tsi_accept_rsp ta_rsp;
+	struct kvec iov = {
+		.iov_base = (u8 *)&ta_req,
+		.iov_len = sizeof(struct tsi_accept_req),
+	};
+	int err;
+
+	nsock = sock_alloc();
+	if (!nsock)
+		return -ENOMEM;
+
+	nsock->type = socket->type;
+	nsock->ops = socket->ops;
+
+    ta_req.svm_port = tsk->svm_port;
+    ta_req.flags = flags;
+
+    memset(&vm_addr, 0, sizeof(struct sockaddr_vm));
+    vm_addr.svm_family = AF_VSOCK;
+    vm_addr.svm_port = TSI_ACCEPT;
+    vm_addr.svm_cid = TSI_CID;
+
+    msg.msg_name = &vm_addr;
+    msg.msg_namelen = sizeof(struct sockaddr_vm);
+
+    err = kernel_sendmsg(control_socket, &msg, &iov, 1, iov.iov_len);
+    if (err < 0) {
+        DPRINTK("%s: error sending accept request\n", __func__);
+        goto out;
+    }
+
+    iov.iov_base = (u8 *) &ta_rsp;
+    iov.iov_len = sizeof(struct tsi_accept_rsp);
+
+    err = kernel_recvmsg(control_socket, &msg, &iov, 1, iov.iov_len, 0);
+    if (err < 0) {
+        DPRINTK("%s: error receiving accept answer\n", __func__);
+        goto out;
+    }
+
+    DPRINTK("%s: response result: %d\n", __func__, ta_rsp.result);
+
+	err = socket->ops->accept(socket, nsock, flags, kern);
+
+ out:
+	if (err < 0) {
+        DPRINTK("%s: vsock accept failed: %d\n", __func__, err);
+		sock_release(nsock);
+	} else {
+        DPRINTK("%s: connection accepted\n", __func__);
+		*newsock = nsock;
+	}
+
+	return err;
+}
+
 static int tsi_accept(struct socket *sock, struct socket *newsock, int flags,
 		      bool kern)
 {
+    struct sockaddr_vm vm_addr;
 	struct tsi_sock *tsk = tsi_sk(sock->sk);
 	struct tsi_sock *newtsk;
 	struct socket *nsock;
@@ -481,19 +594,33 @@ static int tsi_accept(struct socket *sock, struct socket *newsock, int flags,
 	newtsk = tsi_sk(newsock->sk);
 
 	// TODO - Deal with !O_NONBLOCK properly
-	err = tsi_accept_socket(tsk->isocket, &nsock, flags | O_NONBLOCK, kern);
+    /*
+	err = tsi_accept_inet(tsk->isocket, &nsock, flags | O_NONBLOCK, kern);
 	if (err >= 0) {
 		newtsk->status = S_CONNECTED_INET;
 		DPRINTK("%s: switching to CONNECTED_INET\n", __func__);
 		newtsk->isocket = nsock;
-	} else if (err == -EAGAIN) {
-		err = tsi_accept_socket(tsk->vsocket, &nsock, flags, kern);
-		if (err >= 0) {
-			newtsk->status = S_CONNECTED_VSOCK;
-			DPRINTK("%s: switching to CONNECTED_VSOCK\n", __func__);
-			newtsk->vsocket = nsock;
-		}
-	}
+        } else if (err == -EAGAIN) {*/
+    err = tsi_accept_vsock(tsk, &nsock, flags, kern);
+    if (err >= 0) {
+        err = nsock->ops->getname(nsock, (struct sockaddr *) &vm_addr, 0);
+        if (err < 0) {
+            DPRINTK("%s: error in getname: %d\n", __func__, err);
+			return err;
+        }
+        newtsk->svm_port = vm_addr.svm_port;
+        err = nsock->ops->getname(nsock, (struct sockaddr *) &vm_addr, 1);
+        if (err < 0) {
+            DPRINTK("%s: error in peer getname: %d\n", __func__, err);
+			return err;
+        }
+        newtsk->svm_peer_port = vm_addr.svm_port;
+
+        newtsk->status = S_CONNECTED_VSOCK;
+        DPRINTK("%s: switching to CONNECTED_VSOCK\n", __func__);
+        newtsk->vsocket = nsock;
+    }
+        //}
 
 	if (err >= 0)
 		newsock->state = SS_CONNECTED;
@@ -501,26 +628,17 @@ static int tsi_accept(struct socket *sock, struct socket *newsock, int flags,
 	return err;
 }
 
-struct getname_req {
-	u64 id;
-	u32 peer;
-} __attribute__((packed));
-
-struct getname_rsp {
-	u32 addr;
-	u16 port;
-} __attribute__((packed));
-
-static int vsock_proxy_getname(struct socket *vsocket,
+static int vsock_proxy_getname(struct tsi_sock *tsk,
 			       struct sockaddr *addr, int peer)
 {
+    struct socket *vsocket = tsk->vsocket;
 	struct sockaddr_vm vm_addr;
 	struct msghdr msg = { .msg_flags = 0 };
-	struct getname_req gn_req;
-	struct getname_rsp gn_rsp;
+	struct tsi_getname_req gn_req;
+	struct tsi_getname_rsp gn_rsp;
 	struct kvec iov = {
 		.iov_base = (u8 *)&gn_req,
-		.iov_len = sizeof(struct getname_req),
+		.iov_len = sizeof(struct tsi_getname_req),
 	};
 	int err;
 	DECLARE_SOCKADDR(struct sockaddr_in *, sin, addr);
@@ -533,7 +651,8 @@ static int vsock_proxy_getname(struct socket *vsocket,
 		return err;
 	}
 
-	gn_req.id = vm_addr.svm_port;
+	gn_req.svm_port = tsk->svm_port;
+    gn_req.svm_peer_port = tsk->svm_peer_port;
 	gn_req.peer = peer;
 
 	vm_addr.svm_port = TSI_GETNAME;
@@ -549,7 +668,7 @@ static int vsock_proxy_getname(struct socket *vsocket,
 	}
 
 	iov.iov_base = (u8 *)&gn_rsp;
-	iov.iov_len = sizeof(struct getname_rsp);
+	iov.iov_len = sizeof(struct tsi_getname_rsp);
 
 	err = kernel_recvmsg(control_socket, &msg, &iov, 1, iov.iov_len, 0);
 	if (err < 0) {
@@ -572,15 +691,15 @@ static int tsi_getname(struct socket *sock,
 	struct socket *vsocket = tsk->vsocket;
 	DECLARE_SOCKADDR(struct sockaddr_in *, sin, addr);
 
-	DPRINTK("%s: s=%p vs=%p is=%p st=%d peer=%d\n", __func__, sock,
-            vsocket, isocket, tsk->status, peer);
+	DPRINTK("%s: s=%p vs=%p is=%p st=%d svm_port=%u peer=%d\n", __func__, sock,
+            vsocket, isocket, tsk->status, tsk->svm_port, peer);
 
 	switch (tsk->status) {
 	case S_CONNECTED_INET:
 		return isocket->ops->getname(isocket, addr, peer);
 	case S_CONNECTED_VSOCK:
 		if (peer) {
-			return vsock_proxy_getname(vsocket, addr, peer);
+			return vsock_proxy_getname(tsk, addr, peer);
 		} else if (!isocket) {
 			sin->sin_family = AF_INET;
 			sin->sin_port = htons(1234);
@@ -643,20 +762,75 @@ static int tsi_listen(struct socket *sock, int backlog)
 	struct tsi_sock *tsk = tsi_sk(sock->sk);
 	struct socket *isocket = tsk->isocket;
 	struct socket *vsocket = tsk->vsocket;
+    struct sockaddr_in *sin;
+    struct tsi_listen_req lreq;
+    struct tsi_listen_rsp lrsp;
+    struct sockaddr_vm vm_addr;
+    struct msghdr lreq_msg = { .msg_flags = 0 };
+    struct kvec iov = {
+        .iov_base = (u8 *) &lreq,
+        .iov_len = sizeof(struct tsi_listen_req),
+    };
+    int err;
 
 	DPRINTK("%s: vsocket=%p isocket=%p\n", __func__, vsocket, isocket);
-	/*
-	err = vsocket->ops->listen(vsocket, backlog);
-	if (err) {
-		DPRINTK("%s: error setting up vsock listener: %d\n", __func__, err);
-	} else {
-		err = vsock_tsi_listen(vsocket, isocket);
-		if (err) {
-			DPRINTK("%s: error setting up TSI vsock listener: %d\n", __func__, err);
-		}
-	}
-	*/
-	return isocket->ops->listen(isocket, backlog);
+
+    err = vsocket->ops->listen(vsocket, backlog);
+    if (err != 0) {
+        DPRINTK("%s: vsock listen error: %d\n", __func__, err);
+        return err;
+    }
+
+    err = vsocket->ops->getname(vsocket, (struct sockaddr *) &vm_addr, 0);
+    if (err < 0) {
+        DPRINTK("%s: error in getname: %d\n", __func__, err);
+        return err;
+    }
+
+    if (!tsk->bound_addr) {
+        DPRINTK("%s: !bound_addr", __func__);
+        return -EINVAL;
+    }
+    sin = tsk->bound_addr;
+
+    if (!tsk->svm_port) {
+        if (tsi_create_proxy(tsk, SOCK_STREAM) != 0) {
+            return EINVAL;
+        }
+    }
+
+    lreq.svm_port = tsk->svm_port;
+    lreq.addr = sin->sin_addr.s_addr;
+    lreq.port = sin->sin_port;
+    lreq.vm_port = vm_addr.svm_port;
+    lreq.backlog = backlog;
+
+    DPRINTK("%s: requesting to listen on port=%d\n", __func__, lreq.port);
+
+    vm_addr.svm_family = AF_VSOCK;
+    vm_addr.svm_port = TSI_LISTEN;
+    vm_addr.svm_cid = TSI_CID;
+    vm_addr.svm_flags = 0;
+
+    lreq_msg.msg_name = &vm_addr;
+    lreq_msg.msg_namelen = sizeof(struct sockaddr_vm);
+
+    err = kernel_sendmsg(control_socket, &lreq_msg, &iov, 1, iov.iov_len);
+    if (err < 0) {
+        DPRINTK("%s: error sending listen request: %d\n", __func__, err);
+        return err;
+    }
+
+    iov.iov_base = (u8 *) &lrsp;
+    iov.iov_len = sizeof(struct tsi_listen_rsp);
+
+    err = kernel_recvmsg(control_socket, &lreq_msg, &iov, 1, iov.iov_len, 0);
+    if (err < 0) {
+        DPRINTK("%s: error receiving listen request answer\n", __func__);
+        return err;
+    }
+
+    return lrsp.result;
 }
 
 static int tsi_shutdown(struct socket *sock, int mode)
@@ -838,12 +1012,12 @@ static int tsi_dgram_sendmsg(struct socket *sock, struct msghdr *msg,
 
                 sin = (struct sockaddr_in *) msg->msg_name;
 
-                if (tsk->proxy_id == 0) {
+                if (tsk->svm_port == 0) {
                     if (tsi_create_proxy(tsk, SOCK_DGRAM) != 0)
                         return -EINVAL;
                 }
 
-                sa_req.id = tsk->proxy_id;
+                sa_req.svm_port = tsk->svm_port;
                 sa_req.addr = sin->sin_addr.s_addr;
                 sa_req.port = sin->sin_port;
 
@@ -862,8 +1036,11 @@ static int tsi_dgram_sendmsg(struct socket *sock, struct msghdr *msg,
                 }
             }
 
-            memcpy(&tsk->sin_sendto, msg->msg_name, sizeof(struct sockaddr_in));
-            tsk->sendto_loaded = true;
+            if (!tsk->sendto_addr) {
+                tsk->sendto_addr = kmalloc(sizeof(struct sockaddr_in), GFP_KERNEL);
+            }
+            memcpy(tsk->sendto_addr, msg->msg_name, sizeof(struct sockaddr_in));
+
             svm = (struct sockaddr_vm *) msg->msg_name;
             svm->svm_family = AF_VSOCK;
             svm->svm_port = TSI_SENDTO_DATA;
@@ -882,8 +1059,11 @@ static int tsi_dgram_sendmsg(struct socket *sock, struct msghdr *msg,
 	case S_CONNECTED_VSOCK:
 	case S_CONNECTING_VSOCK:
         if (msg->msg_name) {
-            memcpy(&tsk->sin_sendto, msg->msg_name, sizeof(struct sockaddr_in));
-            tsk->sendto_loaded = true;
+            if (!tsk->sendto_addr) {
+                tsk->sendto_addr = kmalloc(sizeof(struct sockaddr_in), GFP_KERNEL);
+            }
+
+            memcpy(tsk->sendto_addr, msg->msg_name, sizeof(struct sockaddr_in));
             svm = (struct sockaddr_vm *) msg->msg_name;
             svm->svm_family = AF_VSOCK;
             svm->svm_port = TSI_SENDTO_DATA;
@@ -937,9 +1117,9 @@ static int tsi_dgram_recvmsg(struct socket *sock, struct msghdr *msg,
 	case S_CONNECTED_VSOCK:
 	case S_CONNECTING_VSOCK:
 		err = vsocket->ops->recvmsg(vsocket, msg, len, flags);
-        if (err > 0 && msg && msg->msg_name && tsk->sendto_loaded) {
-            printk("%s: msg_name=%p sin_sendto=%p, msg_len=%d sin_len=%ld\n", __func__, msg->msg_name, &tsk->sin_sendto, msg->msg_namelen, sizeof(struct sockaddr_in));
-            memcpy(msg->msg_name, &tsk->sin_sendto, sizeof(struct sockaddr_in));
+        if (err > 0 && msg && msg->msg_name && tsk->sendto_addr) {
+            printk("%s: msg_name=%p sin_sendto=%p, msg_len=%d sin_len=%ld\n", __func__, msg->msg_name, tsk->sendto_addr, msg->msg_namelen, sizeof(struct sockaddr_in));
+            memcpy(msg->msg_name, tsk->sendto_addr, sizeof(struct sockaddr_in));
             //memset(msg->msg_name, 0, sizeof(struct sockaddr_in));
         }
         return err;
@@ -1046,8 +1226,10 @@ static int tsi_create(struct net *net, struct socket *sock,
 	tsk->isocket = isocket;
 	tsk->vsocket = vsocket;
 	sock->state = SS_UNCONNECTED;
-    tsk->proxy_id = 0;
-    tsk->sendto_loaded = false;
+    tsk->svm_port = 0;
+    tsk->svm_peer_port = 0;
+    tsk->sendto_addr = NULL;
+    tsk->bound_addr = NULL;
 
 	return 0;
 }
