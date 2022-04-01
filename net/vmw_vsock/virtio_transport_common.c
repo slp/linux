@@ -20,7 +20,7 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/vsock_virtio_transport_common.h>
 
-#define DEBUG 1
+//#define DEBUG 1
 
 #ifdef DEBUG
 #define DPRINTK(...) printk(__VA_ARGS__)
@@ -710,7 +710,7 @@ static s64 virtio_transport_has_space(struct vsock_sock *vsk)
 	struct virtio_vsock_sock *vvs = vsk->trans;
 	s64 bytes;
 
-    DPRINTK("%s: peer_buf_alloc=%d, tx_cnt=%d, peer_fwd_cnt=%d\n", __func__, vvs->peer_buf_alloc, vvs->tx_cnt, vvs->peer_fwd_cnt);
+    DPRINTK("%s: peer_buf_alloc=%d, tx_cnt=%u, peer_fwd_cnt=%u\n", __func__, vvs->peer_buf_alloc, vvs->tx_cnt, vvs->peer_fwd_cnt);
 	bytes = vvs->peer_buf_alloc - (vvs->tx_cnt - vvs->peer_fwd_cnt);
     DPRINTK("%s: bytes=%d\n", __func__, bytes);
 	if (bytes < 0)
@@ -1266,17 +1266,20 @@ virtio_transport_recv_connected(struct sock *sk,
 
 	switch (le16_to_cpu(pkt->hdr.op)) {
 	case VIRTIO_VSOCK_OP_RW:
+        DPRINTK("%s: OP_RW\n", __func__);
 		virtio_transport_recv_enqueue(vsk, pkt);
 		sk->sk_data_ready(sk);
 		return err;
 	case VIRTIO_VSOCK_OP_CREDIT_REQUEST:
-        printk("%s: send_credit_update\n", __func__);
+        DPRINTK("%s: send_credit_update\n", __func__);
 		virtio_transport_send_credit_update(vsk);
 		break;
 	case VIRTIO_VSOCK_OP_CREDIT_UPDATE:
+        DPRINTK("%s: OP_CREDIT_UPDATE\n", __func__);
 		sk->sk_write_space(sk);
 		break;
 	case VIRTIO_VSOCK_OP_SHUTDOWN:
+        DPRINTK("%s: OP_SHUTDOWN\n", __func__);
 		if (le32_to_cpu(pkt->hdr.flags) & VIRTIO_VSOCK_SHUTDOWN_RCV)
 			vsk->peer_shutdown |= RCV_SHUTDOWN;
 		if (le32_to_cpu(pkt->hdr.flags) & VIRTIO_VSOCK_SHUTDOWN_SEND)
@@ -1292,9 +1295,11 @@ virtio_transport_recv_connected(struct sock *sk,
 			sk->sk_state_change(sk);
 		break;
 	case VIRTIO_VSOCK_OP_RST:
+        DPRINTK("%s: OP_RST\n", __func__);
 		virtio_transport_do_close(vsk, true);
 		break;
 	default:
+        DPRINTK("%s: EINVAL\n", __func__);
 		err = -EINVAL;
 		break;
 	}
@@ -1347,6 +1352,7 @@ static bool virtio_transport_space_update(struct sock *sk,
 	spin_lock_bh(&vvs->tx_lock);
 	vvs->peer_buf_alloc = le32_to_cpu(pkt->hdr.buf_alloc);
 	vvs->peer_fwd_cnt = le32_to_cpu(pkt->hdr.fwd_cnt);
+    DPRINTK("%s: peer_fwd_cnt=%u\n", __func__, vvs->peer_fwd_cnt);
 	space_available = virtio_transport_has_space(vsk);
 	spin_unlock_bh(&vvs->tx_lock);
 	return space_available;

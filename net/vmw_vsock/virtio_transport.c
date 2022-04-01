@@ -24,7 +24,7 @@
 #include<linux/sysfs.h>
 #include <linux/refcount.h>
 
-#define DEBUG 1
+//#define DEBUG 1
 
 #ifdef DEBUG
 #define DPRINTK(...) printk(__VA_ARGS__)

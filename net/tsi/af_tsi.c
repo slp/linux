@@ -28,6 +28,7 @@
 #define TSI_SENDTO_DATA   1028
 #define TSI_LISTEN        1029
 #define TSI_ACCEPT        1030
+#define TSI_PROXY_RELEASE 1031
 
 struct socket *control_socket = NULL;
 
@@ -96,6 +97,11 @@ struct tsi_sock {
     struct sockaddr_in *sendto_addr;
 };
 
+struct tsi_proxy_release {
+	u32 svm_port;
+    u32 svm_peer_port;
+} __attribute__((packed));
+
 /* Protocol family. */
 static struct proto tsi_proto = {
 	.name = "AF_TSI",
@@ -136,6 +142,31 @@ static int tsi_release(struct socket *sock)
 	if (!vsocket) {
 		DPRINTK("%s: no vsocket\n", __func__);
 	} else {
+        struct sockaddr_vm vm_addr;
+        struct tsi_proxy_release tpr;
+        struct msghdr msg = { .msg_flags = 0 };
+        struct kvec iov = {
+            .iov_base = (u8 *) &tpr,
+            .iov_len = sizeof(struct tsi_proxy_release),
+        };
+
+        tpr.svm_port = tsk->svm_port;
+        tpr.svm_peer_port = tsk->svm_peer_port;
+
+        memset(&vm_addr, 0, sizeof(struct sockaddr_vm));
+        vm_addr.svm_family = AF_VSOCK;
+        vm_addr.svm_port = TSI_PROXY_RELEASE;
+        vm_addr.svm_cid = TSI_CID;
+
+        msg.msg_name = &vm_addr;
+        msg.msg_namelen = sizeof(struct sockaddr_vm);
+
+        err = kernel_sendmsg(control_socket, &msg, &iov, 1, iov.iov_len);
+        if (err < 0) {
+            DPRINTK("%s: error sending proxy release\n", __func__);
+            return err;
+        }
+
 		err = vsocket->ops->release(vsocket);
 		if (err != 0) {
 			DPRINTK("%s: error releasing vsock socket\n", __func__);
@@ -360,7 +391,6 @@ static int tsi_stream_connect(struct socket *sock, struct sockaddr *addr,
 			return err;
         }
 
-        tsk->svm_peer_port = vm_addr.svm_port;
 		tsk->status = S_CONNECTED_VSOCK;
 
         return 0;
@@ -531,8 +561,8 @@ static int tsi_accept_vsock(struct tsi_sock *tsk, struct socket **newsock,
 	nsock->type = socket->type;
 	nsock->ops = socket->ops;
 
-    ta_req.svm_port = tsk->svm_port;
-    ta_req.flags = flags;
+    //ta_req.svm_port = tsk->svm_port;
+    //ta_req.flags = flags;
 
     memset(&vm_addr, 0, sizeof(struct sockaddr_vm));
     vm_addr.svm_family = AF_VSOCK;
@@ -542,11 +572,13 @@ static int tsi_accept_vsock(struct tsi_sock *tsk, struct socket **newsock,
     msg.msg_name = &vm_addr;
     msg.msg_namelen = sizeof(struct sockaddr_vm);
 
+    /*
     err = kernel_sendmsg(control_socket, &msg, &iov, 1, iov.iov_len);
     if (err < 0) {
         DPRINTK("%s: error sending accept request\n", __func__);
         goto out;
     }
+    */
 
     iov.iov_base = (u8 *) &ta_rsp;
     iov.iov_len = sizeof(struct tsi_accept_rsp);
@@ -640,6 +672,7 @@ static int vsock_proxy_getname(struct tsi_sock *tsk,
 		.iov_base = (u8 *)&gn_req,
 		.iov_len = sizeof(struct tsi_getname_req),
 	};
+    int addr_len;
 	int err;
 	DECLARE_SOCKADDR(struct sockaddr_in *, sin, addr);
 
@@ -679,8 +712,11 @@ static int vsock_proxy_getname(struct tsi_sock *tsk,
 	sin->sin_family = AF_INET;
 	sin->sin_port = gn_rsp.port;
 	sin->sin_addr.s_addr = gn_rsp.addr;
+    addr_len = sizeof(struct sockaddr_in);
 
-	return 0;
+    memcpy(addr, sin, addr_len);
+
+	return addr_len;
 }
 
 static int tsi_getname(struct socket *sock,
@@ -828,7 +864,11 @@ static int tsi_listen(struct socket *sock, int backlog)
     if (err < 0) {
         DPRINTK("%s: error receiving listen request answer\n", __func__);
         return err;
+    } else {
+        tsk->svm_peer_port = TSI_DEFAULT_PORT;
     }
+
+    DPRINTK("%s: listen result=%d", __func__, lrsp.result);
 
     return lrsp.result;
 }
@@ -1227,7 +1267,7 @@ static int tsi_create(struct net *net, struct socket *sock,
 	tsk->vsocket = vsocket;
 	sock->state = SS_UNCONNECTED;
     tsk->svm_port = 0;
-    tsk->svm_peer_port = 0;
+    tsk->svm_peer_port = TSI_DEFAULT_PORT;
     tsk->sendto_addr = NULL;
     tsk->bound_addr = NULL;
 

@@ -110,7 +110,7 @@
 #include <net/sock.h>
 #include <net/af_vsock.h>
 
-#define DEBUG 1
+//#define DEBUG 1
 
 #ifdef DEBUG
 #define DPRINTK(...) printk(__VA_ARGS__)
@@ -1855,6 +1855,7 @@ static int vsock_connectible_sendmsg(struct socket *sock, struct msghdr *msg,
 		       !(sk->sk_shutdown & SEND_SHUTDOWN) &&
 		       !(vsk->peer_shutdown & RCV_SHUTDOWN)) {
 
+            printk("%s: waiting for space\n", __func__);
 			/* Don't wait for non-blocking sockets. */
 			if (timeout == 0) {
 				err = -EAGAIN;
