@@ -66,6 +66,7 @@
 #include <linux/io_uring.h>
 #include <linux/kprobes.h>
 #include <linux/rethook.h>
+#include <linux/reboot.h>
 
 #include <linux/uaccess.h>
 #include <asm/unistd.h>
@@ -761,8 +762,12 @@ void __noreturn do_exit(long code)
 		 * immediately to get a useable coredump.
 		 */
 		if (unlikely(is_global_init(tsk)))
+#ifdef VERBOSE_LIBKRUN
 			panic("Attempted to kill init! exitcode=0x%08x\n",
 				tsk->signal->group_exit_code ?: (int)code);
+#else
+            orderly_reboot();
+#endif
 
 #ifdef CONFIG_POSIX_TIMERS
 		hrtimer_cancel(&tsk->signal->real_timer);
