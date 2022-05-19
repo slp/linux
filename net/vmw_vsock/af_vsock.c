@@ -1057,12 +1057,28 @@ static __poll_t vsock_poll(struct file *file, struct socket *sock,
 	}
 
 	if (sock->type == SOCK_DGRAM) {
-		/* For datagram sockets we can read if there is something in
-		 * the queue and write as long as the socket isn't shutdown for
-		 * sending.
+		bool data_ready_now = false;
+		const struct vsock_transport *transport;
+
+		lock_sock(sk);
+		transport = vsk->transport;
+
+		/* If there is something in the queue then we can read. */
+		if (transport) {
+			int ret = transport->notify_poll_in(
+						vsk, 1, &data_ready_now);
+
+			if (ret < 0) {
+				mask |= EPOLLERR;
+			}
+		}
+		release_sock(sk);
+
+		/* Sockets whose connections have been closed, reset, or
+		 * terminated should also be considered read, and we check the
+		 * shutdown flag for that.
 		 */
-		if (!skb_queue_empty_lockless(&sk->sk_receive_queue) ||
-		    (sk->sk_shutdown & RCV_SHUTDOWN)) {
+		if (data_ready_now || (sk->sk_shutdown & RCV_SHUTDOWN)) {
 			mask |= EPOLLIN | EPOLLRDNORM;
 		}
 
