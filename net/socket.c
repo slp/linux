@@ -112,6 +112,10 @@ unsigned int sysctl_net_busy_read __read_mostly;
 unsigned int sysctl_net_busy_poll __read_mostly;
 #endif
 
+#ifdef CONFIG_TSI
+bool tsi_hijack = false;
+#endif
+
 static ssize_t sock_read_iter(struct kiocb *iocb, struct iov_iter *to);
 static ssize_t sock_write_iter(struct kiocb *iocb, struct iov_iter *from);
 static int sock_mmap(struct file *file, struct vm_area_struct *vma);
@@ -1432,6 +1436,10 @@ call_kill:
 }
 EXPORT_SYMBOL(sock_wake_async);
 
+#ifdef CONFIG_TSI
+core_param(tsi_hijack, tsi_hijack, bool, 0644);
+#endif
+
 /**
  *	__sock_create - creates a socket
  *	@net: net namespace
@@ -1500,6 +1508,15 @@ int __sock_create(struct net *net, int family, int type, int protocol,
 	 */
 	if (rcu_access_pointer(net_families[family]) == NULL)
 		request_module("net-pf-%d", family);
+#endif
+
+#ifdef CONFIG_TSI
+	if (tsi_hijack && !kern && family == AF_INET &&
+	    (type == SOCK_STREAM || type == SOCK_DGRAM)) {
+		pr_debug("%s - tsi: hijacking AF_INET socket\n",
+			current->comm);
+		family = AF_TSI;
+	}
 #endif
 
 	rcu_read_lock();
