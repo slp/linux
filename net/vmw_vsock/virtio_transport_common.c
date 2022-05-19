@@ -179,8 +179,10 @@ static u16 virtio_transport_get_type(struct sock *sk)
 {
 	if (sk->sk_type == SOCK_STREAM)
 		return VIRTIO_VSOCK_TYPE_STREAM;
-	else
+	else if (sk->sk_type == SOCK_SEQPACKET)
 		return VIRTIO_VSOCK_TYPE_SEQPACKET;
+	else
+		return VIRTIO_VSOCK_TYPE_DGRAM;
 }
 
 /* This function can only be used on connecting/connected sockets,
