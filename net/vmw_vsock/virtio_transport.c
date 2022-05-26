@@ -30,6 +30,16 @@ static struct virtio_vsock __rcu *the_virtio_vsock;
 static DEFINE_MUTEX(the_virtio_vsock_mutex); /* protects the_virtio_vsock */
 static struct virtio_transport virtio_transport; /* forward declaration */
 
+static int rx_buf_len = VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE;
+static struct kobject *kobj_ref, *kobj_ref2;
+static ssize_t  dgram_sysfs_show(struct kobject *kobj,
+				 struct kobj_attribute *attr, char *buf);
+static ssize_t  dgram_sysfs_store(struct kobject *kobj,
+				  struct kobj_attribute *attr, const char *buf,
+				  size_t count);
+static struct kobj_attribute rxbuf_attr = __ATTR(dgram_rx_buf_size, 0660, dgram_sysfs_show,
+						 dgram_sysfs_store);
+
 struct virtio_vsock {
 	struct virtio_device *vdev;
 	struct virtqueue **vqs;
@@ -359,7 +369,7 @@ out_rcu:
 
 static void virtio_vsock_rx_fill(struct virtio_vsock *vsock, bool is_dgram)
 {
-	int buf_len = VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE;
+	int buf_len = rx_buf_len;
 	struct virtio_vsock_pkt *pkt;
 	struct scatterlist hdr, buf, *sgs[2];
 	struct virtqueue *vq;
@@ -1084,6 +1094,23 @@ static struct virtio_driver virtio_vsock_driver = {
 #endif
 };
 
+static ssize_t dgram_sysfs_show(struct kobject *kobj,
+				struct kobj_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%d", rx_buf_len);
+}
+
+static ssize_t dgram_sysfs_store(struct kobject *kobj,
+				 struct kobj_attribute *attr, const char *buf,
+				 size_t count)
+{
+	if (kstrtou32(buf, 0, &rx_buf_len) < 0)
+		return -EINVAL;
+	if (rx_buf_len < 1024)
+		rx_buf_len = 1024;
+	return count;
+}
+
 static int __init virtio_vsock_init(void)
 {
 	int ret;
@@ -1101,8 +1128,19 @@ static int __init virtio_vsock_init(void)
 	if (ret)
 		goto out_vci;
 
-	return 0;
+	kobj_ref = kobject_create_and_add("vsock", kernel_kobj);
+	kobj_ref2 = kobject_create_and_add("virtio", kobj_ref);
 
+	/*Creating sysfs file for etx_value*/
+	ret = sysfs_create_file(kobj_ref2, &rxbuf_attr.attr);
+	if (ret)
+		goto out_sysfs;
+
+	return 0;
+out_sysfs:
+	kobject_put(kobj_ref);
+	kobject_put(kobj_ref2);
+	sysfs_remove_file(kobj_ref2, &rxbuf_attr.attr);
 out_vci:
 	vsock_core_unregister(&virtio_transport.transport);
 out_wq:
@@ -1115,6 +1153,10 @@ static void __exit virtio_vsock_exit(void)
 	unregister_virtio_driver(&virtio_vsock_driver);
 	vsock_core_unregister(&virtio_transport.transport);
 	destroy_workqueue(virtio_vsock_workqueue);
+	kobject_put(kobj_ref);
+	kobject_put(kobj_ref2);
+	sysfs_remove_file(kobj_ref2, &rxbuf_attr.attr);
+
 }
 
 module_init(virtio_vsock_init);
