@@ -7,6 +7,8 @@ config TSM_REPORTS
 	select CONFIGFS_FS
 	tristate
 
+source "drivers/virt/coco/cmdline_secret/Kconfig"
+
 source "drivers/virt/coco/efi_secret/Kconfig"
 
 source "drivers/virt/coco/pkvm-guest/Kconfig"
