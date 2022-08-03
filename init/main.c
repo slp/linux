@@ -151,6 +151,11 @@ static char *extra_command_line;
 /* Extra init arguments */
 static char *extra_init_args;
 
+#if defined(CONFIG_CMDLINE_SECRET)
+char __initdata early_secret_cmdline[COMMAND_LINE_SIZE];
+char *secret_cmdline;
+#endif
+
 #ifdef CONFIG_BOOT_CONFIG
 /* Is bootconfig on command line? */
 static bool bootconfig_found;
@@ -665,6 +670,15 @@ static void __init setup_command_line(char *command_line)
 			strcpy(saved_command_line + len, extra_init_args);
 		}
 	}
+
+#ifdef CONFIG_CMDLINE_SECRET
+	secret_cmdline = memblock_alloc(COMMAND_LINE_SIZE, SMP_CACHE_BYTES);
+	strscpy(secret_cmdline, early_secret_cmdline, COMMAND_LINE_SIZE);
+	memzero_explicit(early_secret_cmdline, COMMAND_LINE_SIZE);
+#ifdef CONFIG_X86
+	clflush_cache_range(early_secret_cmdline, COMMAND_LINE_SIZE);
+#endif
+#endif
 }
 
 /*
