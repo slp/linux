@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config CMDLINE_SECRET
+	tristate "CMDLINE secret area securityfs support"
+	depends on CMDLINE_OVERRIDE && X86_64
+	select SECURITYFS
+	help
+	  This is a driver for accessing the CMDLINE secret area via securityfs.
+	  The driver exposes the secrets as files in <securityfs>/secrets/coco.
+	  Files can be read and deleted (deleting a file wipes the secret from
+	  memory).
+
+	  To compile this driver as a module, choose M here.
+	  The module will be called cmdline_secret.
