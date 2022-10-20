@@ -1144,6 +1144,29 @@ void snp_set_wakeup_secondary_cpu(void)
 	apic->wakeup_secondary_cpu = wakeup_cpu_via_vmgexit;
 }
 
+#define KRUN_AP_RESET_VECTOR 0xfffffff4
+
+static int sev_es_setup_ap_reset_vector(struct real_mode_header *rmh)
+{
+	u16 startup_cs, startup_ip;
+	u16 __iomem *ap_reset_vector;
+
+	startup_cs = (u16)(rmh->trampoline_start >> 4);
+	startup_ip = (u16)(rmh->sev_es_trampoline_start -
+			   rmh->trampoline_start);
+
+	ap_reset_vector = ioremap_encrypted(KRUN_AP_RESET_VECTOR, 4);
+	if (!ap_reset_vector)
+		return -EIO;
+
+	writew(startup_ip, &ap_reset_vector[0]);
+	writew(startup_cs, &ap_reset_vector[1]);
+
+	iounmap(ap_reset_vector);
+
+	return 0;
+}
+
 int __init sev_es_setup_ap_jump_table(struct real_mode_header *rmh)
 {
 	u16 startup_cs, startup_ip;
@@ -1155,7 +1178,7 @@ int __init sev_es_setup_ap_jump_table(struct real_mode_header *rmh)
 
 	/* On UP guests there is no jump table so this is not a failure */
 	if (!jump_table_addr)
-		return 0;
+		return sev_es_setup_ap_reset_vector(rmh);
 
 	/* Check if AP Jump Table is page-aligned */
 	if (jump_table_addr & ~PAGE_MASK)
