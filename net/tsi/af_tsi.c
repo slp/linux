@@ -33,7 +33,7 @@ static int tsi_create_control_socket(struct socket **csocket)
 			    SOCK_DGRAM, 0, csocket, 1);
 	if (err) {
 		pr_debug("%s: error creating control socket\n", __func__);
-		goto release;
+		return err;
 	}
 
 	memset(&vm_addr, 0, sizeof(struct sockaddr_vm));
