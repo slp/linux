@@ -1396,6 +1396,7 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 481 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_dispext_cpu0>;
+			apple,dma-range = <0x0 0x0 0x0 0xfc000000>;
 			status = "disabled";
 		};
 
@@ -1406,6 +1407,7 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 481 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_dispext_cpu0>;
+			apple,dma-range = <0xf 0x00000000 0x0 0xfc000000>;
 			status = "disabled";
 		};
 
@@ -1445,7 +1447,6 @@
 			power-domains = <&ps_dispext_cpu0>;
 			resets = <&ps_dispext_cpu0>;
 			clocks = <&clk_dispext0>;
-			apple,asc-dram-mask = <0xf 0x00000000>;
 			status = "disabled";
 			// required bus properties for 'piodma' subdevice
 			#address-cells = <2>;
@@ -1743,6 +1744,13 @@
 			orientation-switch;
 			mode-switch;
 			svid = <0xff01>, <0x8087>;
+			power-domains = <&ps_atc1_usb>;
+		};
+
+		atcphy1_xbar: mux@50304c000 {
+			compatible = "apple,t8103-display-crossbar";
+			reg = <0x5 0x0304c000 0x0 0x4000>;
+			#mux-control-cells = <1>;
 			power-domains = <&ps_atc1_usb>;
 		};
 
