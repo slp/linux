@@ -146,6 +146,10 @@ extern int do_one_initcall(initcall_t fn);
 extern char __initdata boot_command_line[];
 extern char *saved_command_line;
 extern unsigned int saved_command_line_len;
+#if defined(CONFIG_CMDLINE_SECRET)
+extern char __initdata early_secret_cmdline[];
+extern char *secret_cmdline;
+#endif
 extern unsigned int reset_devices;
 
 /* used by init/main.c */

@@ -888,7 +888,9 @@ void __init setup_arch(char **cmdline_p)
 	 */
 	__flush_tlb_all();
 #else
+#ifndef CONFIG_CMDLINE_SECRET
 	printk(KERN_INFO "Command line: %s\n", boot_command_line);
+#endif
 	boot_cpu_data.x86_phys_bits = MAX_PHYSMEM_BITS;
 #endif
 
@@ -973,6 +975,11 @@ void __init setup_arch(char **cmdline_p)
 
 #ifdef CONFIG_CMDLINE_BOOL
 #ifdef CONFIG_CMDLINE_OVERRIDE
+#ifdef CONFIG_CMDLINE_SECRET
+	strscpy(early_secret_cmdline, boot_command_line, COMMAND_LINE_SIZE);
+	memzero_explicit(boot_command_line, COMMAND_LINE_SIZE);
+	clflush_cache_range(boot_command_line, COMMAND_LINE_SIZE);
+#endif
 	strscpy(boot_command_line, builtin_cmdline, COMMAND_LINE_SIZE);
 #else
 	if (builtin_cmdline[0]) {
