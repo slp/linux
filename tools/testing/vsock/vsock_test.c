@@ -1177,6 +1177,413 @@ static void test_seqpacket_msg_peek_server(const struct test_opts *opts)
 	return test_msg_peek_server(opts, true);
 }
 
+static void test_dgram_sendto_client(const struct test_opts *opts)
+{
+	union {
+		struct sockaddr sa;
+		struct sockaddr_vm svm;
+	} addr = {
+		.svm = {
+			.svm_family = AF_VSOCK,
+			.svm_port = 1234,
+			.svm_cid = opts->peer_cid,
+		},
+	};
+	int fd;
+
+	/* Wait for the server to be ready */
+	control_expectln("BIND");
+
+	fd = socket(AF_VSOCK, SOCK_DGRAM, 0);
+	if (fd < 0) {
+		perror("socket");
+		exit(EXIT_FAILURE);
+	}
+
+	sendto_byte(fd, &addr.sa, sizeof(addr.svm), 1, 0);
+
+	/* Notify the server that the client has finished */
+	control_writeln("DONE");
+
+	close(fd);
+}
+
+static void test_dgram_sendto_server(const struct test_opts *opts)
+{
+	union {
+		struct sockaddr sa;
+		struct sockaddr_vm svm;
+	} addr = {
+		.svm = {
+			.svm_family = AF_VSOCK,
+			.svm_port = 1234,
+			.svm_cid = VMADDR_CID_ANY,
+		},
+	};
+	int len = sizeof(addr.sa);
+	int fd;
+
+	fd = socket(AF_VSOCK, SOCK_DGRAM, 0);
+	if (fd < 0) {
+		perror("socket");
+		exit(EXIT_FAILURE);
+	}
+
+	if (bind(fd, &addr.sa, sizeof(addr.svm)) < 0) {
+		perror("bind");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Notify the client that the server is ready */
+	control_writeln("BIND");
+
+	recvfrom_byte(fd, &addr.sa, &len, 1, 0);
+
+	/* Wait for the client to finish */
+	control_expectln("DONE");
+
+	close(fd);
+}
+
+static void test_dgram_connect_client(const struct test_opts *opts)
+{
+	union {
+		struct sockaddr sa;
+		struct sockaddr_vm svm;
+	} addr = {
+		.svm = {
+			.svm_family = AF_VSOCK,
+			.svm_port = 1234,
+			.svm_cid = opts->peer_cid,
+		},
+	};
+	int ret;
+	int fd;
+
+	/* Wait for the server to be ready */
+	control_expectln("BIND");
+
+	fd = socket(AF_VSOCK, SOCK_DGRAM, 0);
+	if (fd < 0) {
+		perror("bind");
+		exit(EXIT_FAILURE);
+	}
+
+	ret = connect(fd, &addr.sa, sizeof(addr.svm));
+	if (ret < 0) {
+		perror("connect");
+		exit(EXIT_FAILURE);
+	}
+
+	send_byte(fd, 1, 0);
+
+	/* Notify the server that the client has finished */
+	control_writeln("DONE");
+
+	close(fd);
+}
+
+static void test_dgram_connect_server(const struct test_opts *opts)
+{
+	test_dgram_sendto_server(opts);
+}
+
+static void test_dgram_multiconn_sendto_client(const struct test_opts *opts)
+{
+	union {
+		struct sockaddr sa;
+		struct sockaddr_vm svm;
+	} addr = {
+		.svm = {
+			.svm_family = AF_VSOCK,
+			.svm_port = 1234,
+			.svm_cid = opts->peer_cid,
+		},
+	};
+	int fds[MULTICONN_NFDS];
+	int i;
+
+	/* Wait for the server to be ready */
+	control_expectln("BIND");
+
+	for (i = 0; i < MULTICONN_NFDS; i++) {
+		fds[i] = socket(AF_VSOCK, SOCK_DGRAM, 0);
+		if (fds[i] < 0) {
+			perror("socket");
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	for (i = 0; i < MULTICONN_NFDS; i++)
+		sendto_byte(fds[i], &addr.sa, sizeof(addr.svm), 1, 0);
+
+	/* Notify the server that the client has finished */
+	control_writeln("DONE");
+
+	for (i = 0; i < MULTICONN_NFDS; i++)
+		close(fds[i]);
+}
+
+static void test_dgram_multiconn_sendto_server(const struct test_opts *opts)
+{
+	union {
+		struct sockaddr sa;
+		struct sockaddr_vm svm;
+	} addr = {
+		.svm = {
+			.svm_family = AF_VSOCK,
+			.svm_port = 1234,
+			.svm_cid = VMADDR_CID_ANY,
+		},
+	};
+	int len = sizeof(addr.sa);
+	int fd;
+	int i;
+
+	fd = socket(AF_VSOCK, SOCK_DGRAM, 0);
+	if (fd < 0) {
+		perror("socket");
+		exit(EXIT_FAILURE);
+	}
+
+	if (bind(fd, &addr.sa, sizeof(addr.svm)) < 0) {
+		perror("bind");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Notify the client that the server is ready */
+	control_writeln("BIND");
+
+	for (i = 0; i < MULTICONN_NFDS; i++)
+		recvfrom_byte(fd, &addr.sa, &len, 1, 0);
+
+	/* Wait for the client to finish */
+	control_expectln("DONE");
+
+	close(fd);
+}
+
+static void test_dgram_multiconn_send_client(const struct test_opts *opts)
+{
+	int fds[MULTICONN_NFDS];
+	int i;
+
+	/* Wait for the server to be ready */
+	control_expectln("BIND");
+
+	for (i = 0; i < MULTICONN_NFDS; i++) {
+		fds[i] = vsock_dgram_connect(opts->peer_cid, 1234);
+		if (fds[i] < 0) {
+			perror("socket");
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	for (i = 0; i < MULTICONN_NFDS; i++)
+		send_byte(fds[i], 1, 0);
+
+	/* Notify the server that the client has finished */
+	control_writeln("DONE");
+
+	for (i = 0; i < MULTICONN_NFDS; i++)
+		close(fds[i]);
+}
+
+static void test_dgram_multiconn_send_server(const struct test_opts *opts)
+{
+	union {
+		struct sockaddr sa;
+		struct sockaddr_vm svm;
+	} addr = {
+		.svm = {
+			.svm_family = AF_VSOCK,
+			.svm_port = 1234,
+			.svm_cid = VMADDR_CID_ANY,
+		},
+	};
+	int fd;
+	int i;
+
+	fd = socket(AF_VSOCK, SOCK_DGRAM, 0);
+	if (fd < 0) {
+		perror("socket");
+		exit(EXIT_FAILURE);
+	}
+
+	if (bind(fd, &addr.sa, sizeof(addr.svm)) < 0) {
+		perror("bind");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Notify the client that the server is ready */
+	control_writeln("BIND");
+
+	for (i = 0; i < MULTICONN_NFDS; i++)
+		recv_byte(fd, 1, 0);
+
+	/* Wait for the client to finish */
+	control_expectln("DONE");
+
+	close(fd);
+}
+
+static void test_dgram_msg_bounds_client(const struct test_opts *opts)
+{
+	unsigned long recv_buf_size;
+	int page_size;
+	int msg_cnt;
+	int fd;
+
+	fd = vsock_dgram_connect(opts->peer_cid, 1234);
+	if (fd < 0) {
+		perror("connect");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Let the server know the client is ready */
+	control_writeln("CLNTREADY");
+
+	msg_cnt = control_readulong();
+	recv_buf_size = control_readulong();
+
+	/* Wait, until receiver sets buffer size. */
+	control_expectln("SRVREADY");
+
+	page_size = getpagesize();
+
+	for (int i = 0; i < msg_cnt; i++) {
+		unsigned long curr_hash;
+		ssize_t send_size;
+		size_t buf_size;
+		void *buf;
+
+		/* Use "small" buffers and "big" buffers. */
+		if (i & 1)
+			buf_size = page_size +
+					(rand() % (MAX_MSG_SIZE - page_size));
+		else
+			buf_size = 1 + (rand() % page_size);
+
+		buf_size = min(buf_size, recv_buf_size);
+
+		buf = malloc(buf_size);
+
+		if (!buf) {
+			perror("malloc");
+			exit(EXIT_FAILURE);
+		}
+
+		memset(buf, rand() & 0xff, buf_size);
+		/* Set at least one MSG_EOR + some random. */
+
+		send_size = send(fd, buf, buf_size, 0);
+
+		if (send_size < 0) {
+			perror("send");
+			exit(EXIT_FAILURE);
+		}
+
+		if (send_size != buf_size) {
+			fprintf(stderr, "Invalid send size\n");
+			exit(EXIT_FAILURE);
+		}
+
+		/* In theory the implementation isn't required to transmit
+		 * these packets in order, so we use this SYNC control message
+		 * so that server and client coordinate sending and receiving
+		 * one packet at a time. The client sends a packet and waits
+		 * until it has been received before sending another.
+		 */
+		control_writeln("PKTSENT");
+		control_expectln("PKTRECV");
+
+		/* Send the server a hash of the packet */
+		curr_hash = hash_djb2(buf, buf_size);
+		control_writeulong(curr_hash);
+		free(buf);
+	}
+
+	control_writeln("SENDDONE");
+	close(fd);
+}
+
+static void test_dgram_msg_bounds_server(const struct test_opts *opts)
+{
+	const unsigned long msg_cnt = 16;
+	unsigned long sock_buf_size;
+	struct msghdr msg = {0};
+	struct iovec iov = {0};
+	char buf[MAX_MSG_SIZE];
+	socklen_t len;
+	int fd;
+	int i;
+
+	fd = vsock_dgram_bind(VMADDR_CID_ANY, 1234);
+
+	if (fd < 0) {
+		perror("bind");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Set receive buffer to maximum */
+	sock_buf_size = -1;
+	if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+		       &sock_buf_size, sizeof(sock_buf_size))) {
+		perror("setsockopt(SO_RECVBUF)");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Retrieve the receive buffer size */
+	len = sizeof(sock_buf_size);
+	if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+		       &sock_buf_size, &len)) {
+		perror("getsockopt(SO_RECVBUF)");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Client ready to receive parameters */
+	control_expectln("CLNTREADY");
+
+	control_writeulong(msg_cnt);
+	control_writeulong(sock_buf_size);
+
+	/* Ready to receive data. */
+	control_writeln("SRVREADY");
+
+	iov.iov_base = buf;
+	iov.iov_len = sizeof(buf);
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+
+	for (i = 0; i < msg_cnt; i++) {
+		unsigned long remote_hash;
+		unsigned long curr_hash;
+		ssize_t recv_size;
+
+		control_expectln("PKTSENT");
+		recv_size = recvmsg(fd, &msg, 0);
+		control_writeln("PKTRECV");
+
+		if (!recv_size)
+			break;
+
+		if (recv_size < 0) {
+			perror("recvmsg");
+			exit(EXIT_FAILURE);
+		}
+
+		curr_hash = hash_djb2(msg.msg_iov[0].iov_base, recv_size);
+		remote_hash = control_readulong();
+
+		if (curr_hash != remote_hash) {
+			fprintf(stderr, "Message bounds broken\n");
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	close(fd);
+}
+
 static struct test_case test_cases[] = {
 	{
 		.name = "SOCK_STREAM connection reset",
@@ -1256,6 +1663,30 @@ static struct test_case test_cases[] = {
 		.name = "SOCK_SEQPACKET MSG_PEEK",
 		.run_client = test_seqpacket_msg_peek_client,
 		.run_server = test_seqpacket_msg_peek_server,
+        },
+		.name = "SOCK_DGRAM client sendto",
+		.run_client = test_dgram_sendto_client,
+		.run_server = test_dgram_sendto_server,
+	},
+	{
+		.name = "SOCK_DGRAM client connect",
+		.run_client = test_dgram_connect_client,
+		.run_server = test_dgram_connect_server,
+	},
+	{
+		.name = "SOCK_DGRAM multiple connections using sendto",
+		.run_client = test_dgram_multiconn_sendto_client,
+		.run_server = test_dgram_multiconn_sendto_server,
+	},
+	{
+		.name = "SOCK_DGRAM multiple connections using send",
+		.run_client = test_dgram_multiconn_send_client,
+		.run_server = test_dgram_multiconn_send_server,
+	},
+	{
+		.name = "SOCK_DGRAM msg bounds",
+		.run_client = test_dgram_msg_bounds_client,
+		.run_server = test_dgram_msg_bounds_server,
 	},
 	{},
 };
