@@ -524,7 +524,8 @@ static int virtio_gpu_resource_create_blob_ioctl(struct drm_device *dev,
 			return PTR_ERR(buf);
 
 		virtio_gpu_cmd_submit(vgdev, buf, rc_blob->cmd_size,
-				      vfpriv->ctx_id, NULL, NULL);
+				      vfpriv->ctx_id, NULL, NULL,
+				      rc_blob->cmd_size, 0);
 	}
 
 	if (guest_blob)
@@ -666,6 +667,14 @@ static int virtio_gpu_context_init_ioctl(struct drm_device *dev,
 
 			vfpriv->explicit_debug_name = true;
 			ret = 0;
+			break;
+		case VIRTGPU_CONTEXT_PARAM_FENCE_PASSING:
+			if (!vgdev->has_fence_passing && value) {
+				ret = -EINVAL;
+				goto out_unlock;
+			}
+
+			vfpriv->fence_passing_enabled = !!value;
 			break;
 		default:
 			ret = -EINVAL;
