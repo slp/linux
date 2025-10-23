@@ -277,7 +277,7 @@ static struct scmi_desc scmi_smc_desc = {
 	.ops = &scmi_smc_ops,
 	.max_rx_timeout_ms = 30,
 	.max_msg = 20,
-	.max_msg_size = 128,
+	.max_msg_size = 256,
 	/*
 	 * Setting .sync_cmds_atomic_replies to true for SMC assumes that,
 	 * once the SMC instruction has completed successfully, the issued
