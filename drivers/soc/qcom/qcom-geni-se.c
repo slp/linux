@@ -19,6 +19,7 @@
 #include <linux/of_platform.h>
 #include <linux/pinctrl/consumer.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/soc/qcom/geni-se.h>
 
 /**
@@ -1358,6 +1359,34 @@ int geni_load_se_firmware(struct geni_se *se, enum geni_se_protocol_type protoco
 }
 EXPORT_SYMBOL_GPL(geni_load_se_firmware);
 
+/*
+ * geni_se_transition_d3d0() - transition from d0 -> d3 or d3 ->d0
+ * @se: pointer to se structure.
+ * @state: decides whether it is D0 -> D3 or D3 ->D0.
+ *	true	: d3 --> d0 (on)
+ *	false	: d0 --> d3 (off)
+ * Return: 0 on success otherwise error.
+ */
+int geni_se_transition_d3d0(struct geni_se *se, bool state)
+{
+	struct device *pwr_dev = se->pd_list->pd_devs[DOMAIN_IDX_POWER];
+	int ret;
+
+	if (!pwr_dev)
+		return -ENODEV;
+
+	if (state)
+		ret = pm_runtime_resume_and_get(pwr_dev);
+	else
+		ret = pm_runtime_put_sync(pwr_dev);
+
+	if (ret)
+		dev_err(se->dev, "failed to switch device state(state=%d) ret=%d\n", state, ret);
+
+	return ret;
+}
+EXPORT_SYMBOL(geni_se_transition_d3d0);
+
 static int geni_se_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -1380,6 +1409,9 @@ static int geni_se_probe(struct platform_device *pdev)
 		desc = device_get_match_data(&pdev->dev);
 		if (!desc)
 			return -EINVAL;
+
+		if (!desc->num_clks)
+			goto out;
 
 		wrapper->num_clks = min_t(unsigned int, desc->num_clks, MAX_CLKS);
 
@@ -1405,6 +1437,7 @@ static int geni_se_probe(struct platform_device *pdev)
 		}
 	}
 
+out:
 	dev_set_drvdata(dev, wrapper);
 	dev_dbg(dev, "GENI SE Driver probed\n");
 	return devm_of_platform_populate(dev);
@@ -1420,6 +1453,11 @@ static const struct geni_se_desc qup_desc = {
 	.num_clks = ARRAY_SIZE(qup_clks),
 };
 
+static const struct geni_se_desc remotely_qup_desc = {
+	.clks = NULL,
+	.num_clks = 0,
+};
+
 static const char * const i2c_master_hub_clks[] = {
 	"s-ahb",
 };
@@ -1432,6 +1470,7 @@ static const struct geni_se_desc i2c_master_hub_desc = {
 static const struct of_device_id geni_se_dt_match[] = {
 	{ .compatible = "qcom,geni-se-qup", .data = &qup_desc },
 	{ .compatible = "qcom,geni-se-i2c-master-hub", .data = &i2c_master_hub_desc },
+	{ .compatible = "qcom,sa8255p-geni-se-qup", .data = &remotely_qup_desc },
 	{}
 };
 MODULE_DEVICE_TABLE(of, geni_se_dt_match);
