@@ -24,8 +24,6 @@ struct arm_smccc_args {
 	unsigned long args[8];
 };
 
-static DEFINE_MUTEX(qcom_scm_lock);
-
 #define QCOM_SCM_EBUSY_WAIT_MS 30
 #define QCOM_SCM_EBUSY_MAX_RETRY 20
 
@@ -125,15 +123,10 @@ static int __scm_smc_do_quirk_handle_waitq(struct device *dev, struct arm_smccc_
 			}
 
 			if (res->a0 == QCOM_SCM_WAITQ_SLEEP) {
-				if (skip_mutex)
-					mutex_unlock(&qcom_scm_lock);
 
 				ret = qcom_scm_wait_for_wq_completion(dev_get_drvdata(dev), wq_ctx);
 				if (ret)
 					return ret;
-
-				if (skip_mutex)
-					mutex_lock(&qcom_scm_lock);
 
 				fill_wq_resume_args(&fill, smc_call_ctx);
 				smc = &fill;
@@ -160,11 +153,11 @@ static int __scm_smc_do(struct device *dev, struct arm_smccc_args *smc,
 	}
 
 	do {
-		mutex_lock(&qcom_scm_lock);
+		down(&qcom_scm_sem_lock);
 
 		ret = __scm_smc_do_quirk_handle_waitq(dev, smc, res, skip_mutex);
 
-		mutex_unlock(&qcom_scm_lock);
+		up(&qcom_scm_sem_lock);
 
 		if (ret)
 			return ret;

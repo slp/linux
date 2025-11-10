@@ -52,6 +52,7 @@ struct qcom_scm {
 	struct mutex scm_bw_lock;
 	int scm_vote_count;
 
+	u64 call_ctx_cnt;
 	u64 dload_mode_addr;
 
 	struct qcom_tzmem_pool *mempool;
@@ -121,6 +122,8 @@ enum qcom_scm_rsctable_resp_type {
 
 #define QSEECOM_MAX_APP_NAME_SIZE		64
 #define SHMBRIDGE_RESULT_NOTSUPP		4
+
+DEFINE_SEMAPHORE(qcom_scm_sem_lock, 1);
 
 /* Each bit configures cold/warm boot address for one of the 4 CPUs */
 static const u8 qcom_scm_cpu_cold_bits[QCOM_SCM_BOOT_MAX_CPUS] = {
@@ -2410,6 +2413,8 @@ static void __check_fw_for_skip_mutex_support(void)
 
 	num_simultaneous_requests = res.result[0] & 0xFF;
 
+	__scm->call_ctx_cnt = res.result[0] & 0xFF;
+
 	__scm->fw_supports_skip_mutex = (num_simultaneous_requests >= MIN_SIMULTANEOUS_REQS);
 }
 
@@ -2653,6 +2658,7 @@ static int qcom_scm_probe(struct platform_device *pdev)
 
 	__get_convention();
 	__check_fw_for_skip_mutex_support();
+	sema_init(&qcom_scm_sem_lock, (int)__scm->call_ctx_cnt);
 
 	/*
 	 * If "download mode" is requested, from this point on warmboot
