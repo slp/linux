@@ -68,6 +68,7 @@ struct qcom_scm_res {
 
 struct qcom_scm;
 int qcom_scm_wait_for_wq_completion(struct qcom_scm *scm, u32 wq_ctx);
+int qcom_scm_waitq_wakeup(struct qcom_scm *scm, unsigned int wq_ctx);
 int scm_get_wq_ctx(u32 *wq_ctx, u32 *flags, u32 *more_pending);
 
 #define SCM_SMC_FNID(s, c)	((((s) & 0xFF) << 8) | ((c) & 0xFF))
@@ -152,6 +153,7 @@ int qcom_scm_shm_bridge_enable(struct device *scm_dev);
 #define QCOM_SCM_SMMU_CONFIG_ERRATA1_CLIENT_ALL	0x02
 
 #define QCOM_SCM_SVC_WAITQ			0x24
+#define QCOM_SCM_WAITQ_ACK			0x01
 #define QCOM_SCM_WAITQ_RESUME			0x02
 #define QCOM_SCM_WAITQ_GET_WQ_CTX		0x03
 
@@ -167,6 +169,7 @@ int qcom_scm_shm_bridge_enable(struct device *scm_dev);
 #define QCOM_SCM_ERROR		-1
 #define QCOM_SCM_INTERRUPTED	1
 #define QCOM_SCM_WAITQ_SLEEP	2
+#define QCOM_SCM_WAITQ_WAKE	3
 
 static inline int qcom_scm_remap_error(int err)
 {

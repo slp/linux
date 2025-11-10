@@ -67,6 +67,17 @@ static void fill_wq_resume_args(struct arm_smccc_args *resume, u32 smc_call_ctx)
 	resume->args[2] = smc_call_ctx;
 }
 
+static void fill_wq_wake_ack_args(struct arm_smccc_args *wake_ack, u32 smc_call_ctx)
+{
+	memset(wake_ack->args, 0, sizeof(wake_ack->args[0]) * ARRAY_SIZE(wake_ack->args));
+	wake_ack->args[0] = ARM_SMCCC_CALL_VAL(ARM_SMCCC_STD_CALL,
+			ARM_SMCCC_SMC_64, ARM_SMCCC_OWNER_SIP,
+			SCM_SMC_FNID(QCOM_SCM_SVC_WAITQ, QCOM_SCM_WAITQ_ACK));
+
+	wake_ack->args[1] = QCOM_SCM_ARGS(1);
+	wake_ack->args[2] = smc_call_ctx;
+}
+
 int scm_get_wq_ctx(u32 *wq_ctx, u32 *flags, u32 *more_pending)
 {
 	int ret;
@@ -90,34 +101,43 @@ int scm_get_wq_ctx(u32 *wq_ctx, u32 *flags, u32 *more_pending)
 	return 0;
 }
 
-static int __scm_smc_do_quirk_handle_waitq(struct device *dev, struct arm_smccc_args *waitq,
+#define IS_WAITQ_SLEEP_OR_WAKE(res) \
+	(res->a0 == QCOM_SCM_WAITQ_SLEEP || res->a0 == QCOM_SCM_WAITQ_WAKE)
+
+static int __scm_smc_do_quirk_handle_waitq(struct device *dev, struct arm_smccc_args *args,
 					   struct arm_smccc_res *res)
 {
 	int ret;
 	u32 wq_ctx, smc_call_ctx;
-	struct arm_smccc_args resume;
-	struct arm_smccc_args *smc = waitq;
+	struct arm_smccc_args fill;
+	struct arm_smccc_args *smc = args;
 
 	do {
 		__scm_smc_do_quirk(smc, res);
 
-		if (res->a0 == QCOM_SCM_WAITQ_SLEEP) {
+		if (IS_WAITQ_SLEEP_OR_WAKE(res)) {
 			wq_ctx = res->a1;
 			smc_call_ctx = res->a2;
 
 			if (!dev) {
-				/* Protect the dev_get_drvdata() call that follows */
+				/* Protect the dev_get_drvdata() calls that follow */
 				return -EPROBE_DEFER;
 			}
 
-			ret = qcom_scm_wait_for_wq_completion(dev_get_drvdata(dev), wq_ctx);
-			if (ret)
-				return ret;
+			if (res->a0 == QCOM_SCM_WAITQ_SLEEP) {
+				ret = qcom_scm_wait_for_wq_completion(dev_get_drvdata(dev), wq_ctx);
+				if (ret)
+					return ret;
 
-			fill_wq_resume_args(&resume, smc_call_ctx);
-			smc = &resume;
+				fill_wq_resume_args(&fill, smc_call_ctx);
+				smc = &fill;
+			} else if (res->a0 == QCOM_SCM_WAITQ_WAKE) {
+				fill_wq_wake_ack_args(&fill, smc_call_ctx);
+				smc = &fill;
+				qcom_scm_waitq_wakeup(dev_get_drvdata(dev), wq_ctx);
+			}
 		}
-	} while (res->a0 == QCOM_SCM_WAITQ_SLEEP);
+	} while (IS_WAITQ_SLEEP_OR_WAKE(res));
 
 	return 0;
 }
