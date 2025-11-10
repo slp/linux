@@ -16,6 +16,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/soc/qcom/geni-se.h>
 #include <linux/spinlock.h>
+#include <linux/units.h>
 
 #define SE_I2C_TX_TRANS_LEN		0x26c
 #define SE_I2C_RX_TRANS_LEN		0x270
@@ -70,12 +71,19 @@ enum geni_i2c_err_code {
 									<< 5)
 
 #define I2C_AUTO_SUSPEND_DELAY	250
-#define KHZ(freq)		(1000 * freq)
 #define PACKING_BYTES_PW	4
 
 #define ABORT_TIMEOUT		HZ
 #define XFER_TIMEOUT		HZ
 #define RST_TIMEOUT		HZ
+
+struct geni_i2c_desc {
+	bool has_core_clk;
+	char *icc_ddr;
+	bool no_dma_support;
+	unsigned int tx_fifo_depth;
+	int (*geni_se_switch_state)(struct device *dev, bool state);
+};
 
 struct geni_i2c_dev {
 	struct geni_se se;
@@ -99,13 +107,7 @@ struct geni_i2c_dev {
 	struct dma_chan *rx_c;
 	bool gpi_mode;
 	bool abort_done;
-};
-
-struct geni_i2c_desc {
-	bool has_core_clk;
-	char *icc_ddr;
-	bool no_dma_support;
-	unsigned int tx_fifo_depth;
+	const struct geni_i2c_desc *dev_data;
 };
 
 struct geni_i2c_err_log {
@@ -146,22 +148,36 @@ struct geni_i2c_clk_fld {
  * clk_freq_out = t / t_cycle
  * source_clock = 19.2 MHz
  */
-static const struct geni_i2c_clk_fld geni_i2c_clk_map[] = {
-	{KHZ(100), 7, 10, 11, 26},
-	{KHZ(400), 2,  5, 12, 24},
-	{KHZ(1000), 1, 3,  9, 18},
+static const struct geni_i2c_clk_fld geni_i2c_clk_map_19p2mhz[] = {
+	{ I2C_MAX_STANDARD_MODE_FREQ, 7, 10, 12, 26 },
+	{ I2C_MAX_FAST_MODE_FREQ, 2,  5, 11, 22 },
+	{ I2C_MAX_FAST_MODE_PLUS_FREQ, 1, 2,  8, 18 },
+	{}
+};
+
+/* source_clock = 32 MHz */
+static const struct geni_i2c_clk_fld geni_i2c_clk_map_32mhz[] = {
+	{ I2C_MAX_STANDARD_MODE_FREQ, 8, 14, 18, 38 },
+	{ I2C_MAX_FAST_MODE_FREQ, 4,  3, 9, 19 },
+	{ I2C_MAX_FAST_MODE_PLUS_FREQ, 2, 3, 5, 15 },
+	{}
 };
 
 static int geni_i2c_clk_map_idx(struct geni_i2c_dev *gi2c)
 {
-	int i;
-	const struct geni_i2c_clk_fld *itr = geni_i2c_clk_map;
+	const struct geni_i2c_clk_fld *itr;
 
-	for (i = 0; i < ARRAY_SIZE(geni_i2c_clk_map); i++, itr++) {
+	if (clk_get_rate(gi2c->se.clk) == 32 * HZ_PER_MHZ)
+		itr = geni_i2c_clk_map_32mhz;
+	else
+		itr = geni_i2c_clk_map_19p2mhz;
+
+	while (itr->clk_freq_out != 0) {
 		if (itr->clk_freq_out == gi2c->clk_freq_out) {
 			gi2c->clk_fld = itr;
 			return 0;
 		}
+		itr++;
 	}
 	return -EINVAL;
 }
@@ -763,10 +779,85 @@ err_tx:
 	return ret;
 }
 
+/**
+ * geni_check_fw_validity: Function to checks firmware validity.
+ * @gi2c: geni i2c device.
+ *
+ * This function checks firmware validity by reading se protocol
+ * register. In case protocol value is not correct, it will try
+ * to load se firmware. if firmware load is failed, it will return
+ * failure. if firmware load is success, it will recheck firmware
+ * validity by checking proto value.
+ *
+ * return: Return 0 if no error, else return error value.
+ */
+static int geni_check_fw_validity(struct geni_i2c_dev *gi2c)
+{
+	struct device *dev = gi2c->se.dev;
+	u32 proto;
+	int ret;
+
+	proto = geni_se_read_proto(&gi2c->se);
+	if (proto == GENI_SE_INVALID_PROTO) {
+		ret = geni_load_se_firmware(&gi2c->se, GENI_SE_I2C);
+		if (ret) {
+			dev_err(dev, "i2c firmware load failed ret: %d\n", ret);
+			return ret;
+		}
+	} else if (proto != GENI_SE_I2C) {
+		dev_err(dev, "Invalid proto %d\n", proto);
+		return -ENXIO;
+	}
+
+	return 0;
+}
+
+/*
+ * geni_i2c_switch_resource_state - switch resources from on -> off or off -> on
+ * @dev: pointer to device structure.
+ * @state: decides whether it is on or off.
+ *
+ * return: 0 on success otherwise error.
+ */
+static int geni_i2c_switch_resource_state(struct device *dev, bool state)
+{
+	struct geni_i2c_dev *gi2c = dev_get_drvdata(dev);
+	int ret = 0;
+
+	if (state) {
+		ret = geni_icc_enable(&gi2c->se);
+		if (ret)
+			return ret;
+
+		ret = clk_prepare_enable(gi2c->core_clk);
+		if (ret) {
+			geni_icc_disable(&gi2c->se);
+			return ret;
+		}
+
+		ret = geni_se_resources_on(&gi2c->se);
+		if (ret) {
+			clk_disable_unprepare(gi2c->core_clk);
+			geni_icc_disable(&gi2c->se);
+			return ret;
+		}
+	} else {
+		ret = geni_se_resources_off(&gi2c->se);
+		if (ret) {
+			enable_irq(gi2c->irq);
+			return ret;
+		}
+
+		clk_disable_unprepare(gi2c->core_clk);
+		ret = geni_icc_disable(&gi2c->se);
+	}
+	return ret;
+}
+
 static int geni_i2c_probe(struct platform_device *pdev)
 {
 	struct geni_i2c_dev *gi2c;
-	u32 proto, tx_depth, fifo_disable;
+	u32 tx_depth, fifo_disable;
 	int ret;
 	struct device *dev = &pdev->dev;
 	const struct geni_i2c_desc *desc = NULL;
@@ -782,22 +873,46 @@ static int geni_i2c_probe(struct platform_device *pdev)
 		return PTR_ERR(gi2c->se.base);
 
 	desc = device_get_match_data(&pdev->dev);
+	if (!desc)
+		return -ENXIO;
 
-	if (desc && desc->has_core_clk) {
-		gi2c->core_clk = devm_clk_get(dev, "core");
-		if (IS_ERR(gi2c->core_clk))
-			return PTR_ERR(gi2c->core_clk);
+	gi2c->dev_data = desc;
+
+	if (!of_device_is_compatible(dev->of_node, "qcom,sa8255p-geni-i2c")) {
+		if (desc->has_core_clk) {
+			gi2c->core_clk = devm_clk_get(dev, "core");
+			if (IS_ERR(gi2c->core_clk))
+				return PTR_ERR(gi2c->core_clk);
+		}
+
+		gi2c->se.clk = devm_clk_get(dev, "se");
+		if (IS_ERR(gi2c->se.clk) && !has_acpi_companion(dev))
+			return PTR_ERR(gi2c->se.clk);
+
+		ret = geni_icc_get(&gi2c->se, desc->icc_ddr);
+		if (ret)
+			return ret;
+		/*
+		 * Set the bus quota for core and cpu to a reasonable value for
+		 * register access.
+		 * Set quota for DDR based on bus speed.
+		 */
+		gi2c->se.icc_paths[GENI_TO_CORE].avg_bw = GENI_DEFAULT_BW;
+		gi2c->se.icc_paths[CPU_TO_GENI].avg_bw = GENI_DEFAULT_BW;
+
+		if (desc->icc_ddr)
+			gi2c->se.icc_paths[GENI_TO_DDR].avg_bw = Bps_to_icc(gi2c->clk_freq_out);
+
+		ret = geni_icc_set_bw(&gi2c->se);
+		if (ret)
+			return ret;
 	}
-
-	gi2c->se.clk = devm_clk_get(dev, "se");
-	if (IS_ERR(gi2c->se.clk) && !has_acpi_companion(dev))
-		return PTR_ERR(gi2c->se.clk);
 
 	ret = device_property_read_u32(dev, "clock-frequency",
 				       &gi2c->clk_freq_out);
 	if (ret) {
 		dev_info(dev, "Bus frequency not specified, default to 100kHz.\n");
-		gi2c->clk_freq_out = KHZ(100);
+		gi2c->clk_freq_out = I2C_MAX_STANDARD_MODE_FREQ;
 	}
 
 	if (has_acpi_companion(dev))
@@ -808,62 +923,42 @@ static int geni_i2c_probe(struct platform_device *pdev)
 		return gi2c->irq;
 
 	ret = geni_i2c_clk_map_idx(gi2c);
-	if (ret) {
-		dev_err(dev, "Invalid clk frequency %d Hz: %d\n",
-			gi2c->clk_freq_out, ret);
-		return ret;
-	}
+	if (ret)
+		return dev_err_probe(dev, ret, "Invalid clk frequency %d Hz\n",
+				     gi2c->clk_freq_out);
 
 	gi2c->adap.algo = &geni_i2c_algo;
 	init_completion(&gi2c->done);
 	spin_lock_init(&gi2c->lock);
 	platform_set_drvdata(pdev, gi2c);
+
+	/* Keep interrupts disabled initially to allow for low-power modes */
 	ret = devm_request_irq(dev, gi2c->irq, geni_i2c_irq, IRQF_NO_AUTOEN,
 			       dev_name(dev), gi2c);
-	if (ret) {
-		dev_err(dev, "Request_irq failed:%d: err:%d\n",
-			gi2c->irq, ret);
-		return ret;
-	}
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "Request_irq failed: %d\n", gi2c->irq);
+
 	i2c_set_adapdata(&gi2c->adap, gi2c);
 	gi2c->adap.dev.parent = dev;
 	gi2c->adap.dev.of_node = dev->of_node;
 	strscpy(gi2c->adap.name, "Geni-I2C", sizeof(gi2c->adap.name));
 
-	ret = geni_icc_get(&gi2c->se, desc ? desc->icc_ddr : "qup-memory");
-	if (ret)
-		return ret;
-	/*
-	 * Set the bus quota for core and cpu to a reasonable value for
-	 * register access.
-	 * Set quota for DDR based on bus speed.
-	 */
-	gi2c->se.icc_paths[GENI_TO_CORE].avg_bw = GENI_DEFAULT_BW;
-	gi2c->se.icc_paths[CPU_TO_GENI].avg_bw = GENI_DEFAULT_BW;
-	if (!desc || desc->icc_ddr)
-		gi2c->se.icc_paths[GENI_TO_DDR].avg_bw = Bps_to_icc(gi2c->clk_freq_out);
+	gi2c->suspended = 1;
+	pm_runtime_set_suspended(gi2c->se.dev);
+	pm_runtime_set_autosuspend_delay(gi2c->se.dev, I2C_AUTO_SUSPEND_DELAY);
+	pm_runtime_use_autosuspend(gi2c->se.dev);
+	pm_runtime_enable(gi2c->se.dev);
 
-	ret = geni_icc_set_bw(&gi2c->se);
-	if (ret)
-		return ret;
-
-	ret = clk_prepare_enable(gi2c->core_clk);
-	if (ret)
-		return ret;
-
-	ret = geni_se_resources_on(&gi2c->se);
-	if (ret) {
-		dev_err(dev, "Error turning on resources %d\n", ret);
-		clk_disable_unprepare(gi2c->core_clk);
-		return ret;
+	ret = pm_runtime_get_sync(gi2c->se.dev);
+	if (ret < 0) {
+		dev_err(gi2c->se.dev, "error turning on device :%d\n", ret);
+		goto err;
 	}
-	proto = geni_se_read_proto(&gi2c->se);
-	if (proto != GENI_SE_I2C) {
-		dev_err(dev, "Invalid proto %d\n", proto);
-		geni_se_resources_off(&gi2c->se);
-		clk_disable_unprepare(gi2c->core_clk);
-		return -ENXIO;
-	}
+
+	ret = geni_check_fw_validity(gi2c);
+	if (ret)
+		goto err;
 
 	if (desc && desc->no_dma_support)
 		fifo_disable = false;
@@ -875,9 +970,8 @@ static int geni_i2c_probe(struct platform_device *pdev)
 		gi2c->gpi_mode = true;
 		ret = setup_gpi_dma(gi2c);
 		if (ret) {
-			geni_se_resources_off(&gi2c->se);
-			clk_disable_unprepare(gi2c->core_clk);
-			return dev_err_probe(dev, ret, "Failed to setup GPI DMA mode\n");
+			dev_err_probe(dev, ret, "Failed to setup GPI DMA mode\n");
+			goto err;
 		}
 
 		dev_dbg(dev, "Using GPI DMA mode for I2C\n");
@@ -890,10 +984,9 @@ static int geni_i2c_probe(struct platform_device *pdev)
 			tx_depth = desc->tx_fifo_depth;
 
 		if (!tx_depth) {
-			dev_err(dev, "Invalid TX FIFO depth\n");
-			geni_se_resources_off(&gi2c->se);
-			clk_disable_unprepare(gi2c->core_clk);
-			return -EINVAL;
+			ret = dev_err_probe(dev, -EINVAL,
+					    "Invalid TX FIFO depth\n");
+			goto err;
 		}
 
 		gi2c->tx_wm = tx_depth - 1;
@@ -904,36 +997,28 @@ static int geni_i2c_probe(struct platform_device *pdev)
 		dev_dbg(dev, "i2c fifo/se-dma mode. fifo depth:%d\n", tx_depth);
 	}
 
-	clk_disable_unprepare(gi2c->core_clk);
-	ret = geni_se_resources_off(&gi2c->se);
-	if (ret) {
-		dev_err(dev, "Error turning off resources %d\n", ret);
+	ret = pm_runtime_put_sync(gi2c->se.dev);
+	if (ret < 0) {
+		dev_err(gi2c->se.dev, "error turning off device :%d\n", ret);
 		goto err_dma;
 	}
 
-	ret = geni_icc_disable(&gi2c->se);
-	if (ret)
-		goto err_dma;
-
-	gi2c->suspended = 1;
-	pm_runtime_set_suspended(gi2c->se.dev);
-	pm_runtime_set_autosuspend_delay(gi2c->se.dev, I2C_AUTO_SUSPEND_DELAY);
-	pm_runtime_use_autosuspend(gi2c->se.dev);
-	pm_runtime_enable(gi2c->se.dev);
-
 	ret = i2c_add_adapter(&gi2c->adap);
 	if (ret) {
-		dev_err(dev, "Error adding i2c adapter %d\n", ret);
+		dev_err_probe(dev, ret, "Error adding i2c adapter\n");
 		pm_runtime_disable(gi2c->se.dev);
 		goto err_dma;
 	}
 
 	dev_dbg(dev, "Geni-I2C adaptor successfully added\n");
 
-	return 0;
+	return ret;
 
 err_dma:
 	release_gpi_dma(gi2c);
+	return ret;
+err:
+	pm_runtime_put_sync(gi2c->se.dev);
 	return ret;
 }
 
@@ -956,7 +1041,7 @@ static void geni_i2c_shutdown(struct platform_device *pdev)
 
 static int __maybe_unused geni_i2c_runtime_suspend(struct device *dev)
 {
-	int ret;
+	int ret = 0;
 	struct geni_i2c_dev *gi2c = dev_get_drvdata(dev);
 
 	disable_irq(gi2c->irq);
@@ -964,43 +1049,35 @@ static int __maybe_unused geni_i2c_runtime_suspend(struct device *dev)
 	if (ret) {
 		enable_irq(gi2c->irq);
 		return ret;
-
-	} else {
-		gi2c->suspended = 1;
 	}
 
-	clk_disable_unprepare(gi2c->core_clk);
+	if (gi2c->dev_data->geni_se_switch_state) {
+		ret = gi2c->dev_data->geni_se_switch_state(dev, false);
+		if (ret) {
+			dev_err(dev, "failed to switch resources, ret:%d\n", ret);
+			return ret;
+		}
+	}
 
-	return geni_icc_disable(&gi2c->se);
+	gi2c->suspended = 1;
+	return ret;
 }
 
 static int __maybe_unused geni_i2c_runtime_resume(struct device *dev)
 {
-	int ret;
+	int ret = 0;
 	struct geni_i2c_dev *gi2c = dev_get_drvdata(dev);
 
-	ret = geni_icc_enable(&gi2c->se);
-	if (ret)
-		return ret;
-
-	ret = clk_prepare_enable(gi2c->core_clk);
-	if (ret)
-		goto out_icc_disable;
-
-	ret = geni_se_resources_on(&gi2c->se);
-	if (ret)
-		goto out_clk_disable;
+	if (gi2c->dev_data->geni_se_switch_state) {
+		ret = gi2c->dev_data->geni_se_switch_state(dev, true);
+		if (ret) {
+			dev_err(dev, "failed to switch resources, ret:%d\n", ret);
+			return ret;
+		}
+	}
 
 	enable_irq(gi2c->irq);
 	gi2c->suspended = 0;
-
-	return 0;
-
-out_clk_disable:
-	clk_disable_unprepare(gi2c->core_clk);
-out_icc_disable:
-	geni_icc_disable(&gi2c->se);
-
 	return ret;
 }
 
@@ -1033,16 +1110,28 @@ static const struct dev_pm_ops geni_i2c_pm_ops = {
 									NULL)
 };
 
+static const struct geni_i2c_desc geni_i2c = {
+	.icc_ddr = "qup-memory",
+	.geni_se_switch_state = geni_i2c_switch_resource_state,
+};
+
+static const struct geni_i2c_desc remotely_geni_i2c = {
+	.icc_ddr = "qup-memory",
+	.geni_se_switch_state = NULL,
+};
+
 static const struct geni_i2c_desc i2c_master_hub = {
 	.has_core_clk = true,
 	.icc_ddr = NULL,
 	.no_dma_support = true,
 	.tx_fifo_depth = 16,
+	.geni_se_switch_state = geni_i2c_switch_resource_state,
 };
 
 static const struct of_device_id geni_i2c_dt_match[] = {
-	{ .compatible = "qcom,geni-i2c" },
+	{ .compatible = "qcom,geni-i2c", .data = &geni_i2c },
 	{ .compatible = "qcom,geni-i2c-master-hub", .data = &i2c_master_hub },
+	{ .compatible = "qcom,sa8255p-geni-i2c", .data = &remotely_geni_i2c },
 	{}
 };
 MODULE_DEVICE_TABLE(of, geni_i2c_dt_match);
