@@ -41,6 +41,9 @@ extern int qcom_scm_invoke_callback_response(phys_addr_t out_buf,
 extern int qcom_scm_sec_wdog_deactivate(void);
 extern int qcom_scm_sec_wdog_trigger(void);
 extern int qcom_scm_spin_cpu(void);
+extern int qcom_scm_ddrbw_profiler(phys_addr_t in_buf, size_t in_buf_size,
+				   phys_addr_t out_buf, size_t out_buf_size);
+extern int qcom_scm_she_op(u64 _arg1, u64 _arg2, u64 _arg3, u64 _arg4);
 #else
 static inline bool qcom_scm_dcvs_ca_available(void)
 {
@@ -154,5 +157,15 @@ static inline int qcom_scm_spin_cpu(void)
 	return -EPERM;
 }
 
+static inline int qcom_scm_ddrbw_profiler(phys_addr_t in_buf, size_t in_buf_size,
+				   phys_addr_t out_buf, size_t out_buf_size)
+{
+	return -EPERM;
+}
+
+static inline int qcom_scm_she_op(u64 _arg1, u64 _arg2, u64 _arg3, u64 _arg4)
+{
+	return -EPERM;
+}
 #endif
 #endif
