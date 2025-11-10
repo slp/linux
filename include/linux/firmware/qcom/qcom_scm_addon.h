@@ -41,6 +41,7 @@ extern int qcom_scm_invoke_callback_response(phys_addr_t out_buf,
 extern int qcom_scm_sec_wdog_deactivate(void);
 extern int qcom_scm_sec_wdog_trigger(void);
 extern void qcom_scm_disable_sdi(void);
+extern int qcom_scm_spin_cpu(void);
 #else
 static inline bool qcom_scm_dcvs_ca_available(void)
 {
@@ -150,6 +151,11 @@ static inline int qcom_scm_sec_wdog_trigger(void)
 }
 
 static inline void qcom_scm_disable_sdi(void) { }
+
+static inline int qcom_scm_spin_cpu(void)
+{
+	return -EPERM;
+}
 
 #endif
 #endif
