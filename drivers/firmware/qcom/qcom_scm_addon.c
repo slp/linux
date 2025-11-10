@@ -317,7 +317,7 @@ int qcom_scm_invoke_smc(phys_addr_t in_buf, size_t in_buf_size,
 	};
 	struct qcom_scm_res res;
 
-	ret = qcom_scm_call_atomic(__scm->dev, &desc, &res);
+	ret = qcom_scm_call(__scm->dev, &desc, &res);
 
 	if (result)
 		*result = res.result[1];
@@ -351,7 +351,7 @@ int qcom_scm_invoke_smc_legacy(phys_addr_t in_buf, size_t in_buf_size,
 
 	struct qcom_scm_res res;
 
-	ret = qcom_scm_call_atomic(__scm->dev, &desc, &res);
+	ret = qcom_scm_call(__scm->dev, &desc, &res);
 
 	if (result)
 		*result = res.result[1];
@@ -381,7 +381,7 @@ int qcom_scm_invoke_callback_response(phys_addr_t out_buf,
 	};
 	struct qcom_scm_res res;
 
-	ret = qcom_scm_call_atomic(__scm->dev, &desc, &res);
+	ret = qcom_scm_call(__scm->dev, &desc, &res);
 
 	if (result)
 		*result = res.result[1];
