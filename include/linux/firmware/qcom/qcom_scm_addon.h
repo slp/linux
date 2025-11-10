@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2023-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #ifndef __QCOM_SCM_ADDON_H
@@ -40,7 +40,6 @@ extern int qcom_scm_invoke_callback_response(phys_addr_t out_buf,
 			unsigned int *data);
 extern int qcom_scm_sec_wdog_deactivate(void);
 extern int qcom_scm_sec_wdog_trigger(void);
-extern void qcom_scm_disable_sdi(void);
 extern int qcom_scm_spin_cpu(void);
 #else
 static inline bool qcom_scm_dcvs_ca_available(void)
@@ -149,8 +148,6 @@ static inline int qcom_scm_sec_wdog_trigger(void)
 {
 	return -EPERM;
 }
-
-static inline void qcom_scm_disable_sdi(void) { }
 
 static inline int qcom_scm_spin_cpu(void)
 {
