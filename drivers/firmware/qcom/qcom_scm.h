@@ -56,6 +56,7 @@ struct qcom_scm_desc {
 	u32 arginfo;
 	u64 args[MAX_QCOM_SCM_ARGS];
 	u32 owner;
+	bool skip_mutex;
 };
 
 /**
@@ -70,6 +71,8 @@ struct qcom_scm;
 int qcom_scm_wait_for_wq_completion(struct qcom_scm *scm, u32 wq_ctx);
 int qcom_scm_waitq_wakeup(struct qcom_scm *scm, unsigned int wq_ctx);
 int scm_get_wq_ctx(u32 *wq_ctx, u32 *flags, u32 *more_pending);
+bool qcom_scm_multi_call_allow(struct device *dev, bool multicall_allowed);
+bool fw_supports_skip_mutex(struct device *dev);
 
 #define SCM_SMC_FNID(s, c)	((((s) & 0xFF) << 8) | ((c) & 0xFF))
 int __scm_smc_call(struct device *dev, const struct qcom_scm_desc *desc,
@@ -156,6 +159,7 @@ int qcom_scm_shm_bridge_enable(struct device *scm_dev);
 #define QCOM_SCM_WAITQ_ACK			0x01
 #define QCOM_SCM_WAITQ_RESUME			0x02
 #define QCOM_SCM_WAITQ_GET_WQ_CTX		0x03
+#define QCOM_SCM_GET_WQ_QUEUE_INFO		0x04
 
 #define QCOM_SCM_SVC_GPU			0x28
 #define QCOM_SCM_SVC_GPU_INIT_REGS		0x01

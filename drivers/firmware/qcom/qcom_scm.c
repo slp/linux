@@ -45,6 +45,7 @@ struct qcom_scm {
 	struct clk *bus_clk;
 	struct icc_path *path;
 	struct xarray waitq;
+	bool fw_supports_skip_mutex;
 	struct reset_controller_dev reset;
 
 	/* control access to the interconnect path */
@@ -2390,6 +2391,35 @@ bool qcom_scm_is_available(void)
 }
 EXPORT_SYMBOL_GPL(qcom_scm_is_available);
 
+#define MIN_SIMULTANEOUS_REQS 2
+static void __check_fw_for_skip_mutex_support(void)
+{
+	int ret, num_simultaneous_requests;
+	struct qcom_scm_desc desc = {
+		.svc = QCOM_SCM_SVC_WAITQ,
+		.cmd = QCOM_SCM_GET_WQ_QUEUE_INFO,
+		.owner = ARM_SMCCC_OWNER_SIP,
+	};
+	struct qcom_scm_res res;
+
+	ret = qcom_scm_call_atomic(__scm->dev, &desc, &res);
+	if (ret) {
+		dev_err(__scm->dev, "Failed to determine skip mutex fw support\n");
+		return;
+	}
+
+	num_simultaneous_requests = res.result[0] & 0xFF;
+
+	__scm->fw_supports_skip_mutex = (num_simultaneous_requests >= MIN_SIMULTANEOUS_REQS);
+}
+
+bool fw_supports_skip_mutex(struct device *dev)
+{
+	struct qcom_scm *scm = dev_get_drvdata(dev);
+
+	return scm->fw_supports_skip_mutex;
+}
+
 static struct completion *qcom_scm_get_completion(struct qcom_scm *scm, u32 wq_ctx)
 {
 	struct completion *wq;
@@ -2622,6 +2652,7 @@ static int qcom_scm_probe(struct platform_device *pdev)
 	smp_store_release(&__scm, scm);
 
 	__get_convention();
+	__check_fw_for_skip_mutex_support();
 
 	/*
 	 * If "download mode" is requested, from this point on warmboot
