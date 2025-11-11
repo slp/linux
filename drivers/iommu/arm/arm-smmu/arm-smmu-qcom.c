@@ -374,8 +374,19 @@ static int qcom_adreno_smmu_init_context(struct arm_smmu_domain *smmu_domain,
 	const struct of_device_id *client_match;
 	int cbndx = smmu_domain->cfg.cbndx;
 	struct adreno_smmu_priv *priv;
+	u32 val;
 
 	smmu_domain->cfg.flush_walk_prefer_tlbiasid = true;
+
+	/*
+	 * For those client where qcom,iommu-vmid is not defined, default arm-smmu pgtable
+	 * alloc/free handler will be used.
+	 */
+	if (of_property_read_u32(dev->of_node, "qcom,iommu-vmid", &val) == 0) {
+		smmu_domain->secure_vmid = val;
+		pgtbl_cfg->alloc = qcom_alloc_pages;
+		pgtbl_cfg->free = qcom_free_pages;
+	}
 
 	client_match = qsmmu->data->client_match;
 
