@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2010,2015,2019 The Linux Foundation. All rights reserved.
  * Copyright (C) 2015 Linaro Ltd.
+ * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/arm-smccc.h>
@@ -30,6 +31,7 @@
 #include <linux/remoteproc.h>
 #include <linux/sizes.h>
 #include <linux/types.h>
+#include <linux/xarray.h>
 
 #include "qcom_scm.h"
 #include "qcom_tzmem.h"
@@ -42,13 +44,15 @@ struct qcom_scm {
 	struct clk *iface_clk;
 	struct clk *bus_clk;
 	struct icc_path *path;
-	struct completion waitq_comp;
+	struct xarray waitq;
+	bool fw_supports_skip_mutex;
 	struct reset_controller_dev reset;
 
 	/* control access to the interconnect path */
 	struct mutex scm_bw_lock;
 	int scm_vote_count;
 
+	u64 call_ctx_cnt;
 	u64 dload_mode_addr;
 
 	struct qcom_tzmem_pool *mempool;
@@ -118,6 +122,8 @@ enum qcom_scm_rsctable_resp_type {
 
 #define QSEECOM_MAX_APP_NAME_SIZE		64
 #define SHMBRIDGE_RESULT_NOTSUPP		4
+
+DEFINE_SEMAPHORE(qcom_scm_sem_lock, 1);
 
 /* Each bit configures cold/warm boot address for one of the 4 CPUs */
 static const u8 qcom_scm_cpu_cold_bits[QCOM_SCM_BOOT_MAX_CPUS] = {
@@ -2388,42 +2394,104 @@ bool qcom_scm_is_available(void)
 }
 EXPORT_SYMBOL_GPL(qcom_scm_is_available);
 
-static int qcom_scm_assert_valid_wq_ctx(u32 wq_ctx)
+#define MIN_SIMULTANEOUS_REQS 2
+static void __check_fw_for_skip_mutex_support(void)
 {
-	/* FW currently only supports a single wq_ctx (zero).
-	 * TODO: Update this logic to include dynamic allocation and lookup of
-	 * completion structs when FW supports more wq_ctx values.
-	 */
-	if (wq_ctx != 0) {
-		dev_err(__scm->dev, "Firmware unexpectedly passed non-zero wq_ctx\n");
-		return -EINVAL;
+	int ret, num_simultaneous_requests;
+	struct qcom_scm_desc desc = {
+		.svc = QCOM_SCM_SVC_WAITQ,
+		.cmd = QCOM_SCM_GET_WQ_QUEUE_INFO,
+		.owner = ARM_SMCCC_OWNER_SIP,
+	};
+	struct qcom_scm_res res;
+
+	ret = qcom_scm_call_atomic(__scm->dev, &desc, &res);
+	if (ret) {
+		dev_err(__scm->dev, "Failed to determine skip mutex fw support\n");
+		return;
 	}
 
+	num_simultaneous_requests = res.result[0] & 0xFF;
+
+	__scm->call_ctx_cnt = res.result[0] & 0xFF;
+
+	__scm->fw_supports_skip_mutex = (num_simultaneous_requests >= MIN_SIMULTANEOUS_REQS);
+}
+
+bool fw_supports_skip_mutex(struct device *dev)
+{
+	struct qcom_scm *scm = dev_get_drvdata(dev);
+
+	return scm->fw_supports_skip_mutex;
+}
+
+static struct completion *qcom_scm_get_completion(struct qcom_scm *scm, u32 wq_ctx)
+{
+	struct completion *wq;
+	int err;
+
+	wq = xa_load(&scm->waitq, wq_ctx);
+	if (wq) {
+		/*
+		 * Valid struct completion *wq found corresponding to
+		 * given wq_ctx. We're done here.
+		 */
+		goto out;
+	}
+
+	/*
+	 * If a struct completion *wq does not exist for wq_ctx, create it. FW
+	 * only uses a finite number of wq_ctx values, so we will be reaching
+	 * here only a few times right at the beginning of the device's uptime
+	 * and then early-exit from idr_find() above subsequently.
+	 */
+
+	wq = kzalloc(sizeof(*wq), GFP_ATOMIC);
+	if (!wq) {
+		wq = ERR_PTR(-ENOMEM);
+		goto out;
+	}
+	init_completion(wq);
+
+	err = xa_err(xa_store(&scm->waitq, wq_ctx, wq, GFP_ATOMIC));
+	if (err) {
+		/* Don't wait for driver to be unloaded to free wq */
+		kfree(wq);
+		wq = ERR_PTR(err);
+	}
+
+out:
+	return wq;
+}
+
+int qcom_scm_wait_for_wq_completion(struct qcom_scm *scm, u32 wq_ctx)
+{
+	struct completion *wq;
+
+	wq = qcom_scm_get_completion(scm, wq_ctx);
+	if (IS_ERR(wq)) {
+		pr_err("Unable to wait on invalid waitqueue for wq_ctx %d: %ld\n",
+				wq_ctx, PTR_ERR(wq));
+		return PTR_ERR(wq);
+	}
+
+	wait_for_completion(wq);
+
 	return 0;
 }
 
-int qcom_scm_wait_for_wq_completion(u32 wq_ctx)
+int qcom_scm_waitq_wakeup(struct qcom_scm *scm, unsigned int wq_ctx)
 {
-	int ret;
+	struct completion *wq;
 
-	ret = qcom_scm_assert_valid_wq_ctx(wq_ctx);
-	if (ret)
-		return ret;
+	wq = qcom_scm_get_completion(scm, wq_ctx);
+	if (IS_ERR(wq)) {
+		pr_err("Unable to wake up invalid waitqueue for wq_ctx %d: %ld\n",
+				wq_ctx, PTR_ERR(wq));
+		return PTR_ERR(wq);
+	}
 
-	wait_for_completion(&__scm->waitq_comp);
-
-	return 0;
-}
-
-static int qcom_scm_waitq_wakeup(unsigned int wq_ctx)
-{
-	int ret;
-
-	ret = qcom_scm_assert_valid_wq_ctx(wq_ctx);
-	if (ret)
-		return ret;
-
-	complete(&__scm->waitq_comp);
+	complete(wq);
 
 	return 0;
 }
@@ -2446,7 +2514,7 @@ static irqreturn_t qcom_scm_irq_handler(int irq, void *data)
 			goto out;
 		}
 
-		ret = qcom_scm_waitq_wakeup(wq_ctx);
+		ret = qcom_scm_waitq_wakeup(scm, wq_ctx);
 		if (ret)
 			goto out;
 	} while (more_pending);
@@ -2494,6 +2562,10 @@ static const struct kernel_param_ops download_mode_param_ops = {
 module_param_cb(download_mode, &download_mode_param_ops, NULL, 0644);
 MODULE_PARM_DESC(download_mode, "download mode: off/0/N for no dump mode, full/on/1/Y for full dump mode, mini for minidump mode and full,mini for both full and minidump mode together are acceptable values");
 
+#ifdef CONFIG_QCOM_SCM_ADDON
+#include "qcom_scm_addon.c"
+#endif
+
 static int qcom_scm_probe(struct platform_device *pdev)
 {
 	struct qcom_tzmem_pool_config pool_config;
@@ -2509,7 +2581,6 @@ static int qcom_scm_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return ret;
 
-	init_completion(&scm->waitq_comp);
 	mutex_init(&scm->scm_bw_lock);
 
 	scm->path = devm_of_icc_get(&pdev->dev, NULL);
@@ -2540,6 +2611,9 @@ static int qcom_scm_probe(struct platform_device *pdev)
 	ret = clk_set_rate(scm->core_clk, INT_MAX);
 	if (ret)
 		return ret;
+
+	platform_set_drvdata(pdev, scm);
+	xa_init(&scm->waitq);
 
 	ret = of_reserved_mem_device_init(scm->dev);
 	if (ret && ret != -ENODEV)
@@ -2583,6 +2657,8 @@ static int qcom_scm_probe(struct platform_device *pdev)
 	smp_store_release(&__scm, scm);
 
 	__get_convention();
+	__check_fw_for_skip_mutex_support();
+	sema_init(&qcom_scm_sem_lock, (int)__scm->call_ctx_cnt);
 
 	/*
 	 * If "download mode" is requested, from this point on warmboot
@@ -2615,8 +2691,21 @@ static int qcom_scm_probe(struct platform_device *pdev)
 
 static void qcom_scm_shutdown(struct platform_device *pdev)
 {
+	struct qcom_scm *scm;
+	struct completion *c;
+	unsigned long index;
+
+	scm = platform_get_drvdata(pdev);
+
 	/* Clean shutdown, disable download mode to allow normal restart */
-	qcom_scm_set_download_mode(QCOM_DLOAD_NODUMP);
+	qcom_scm_set_download_mode(false);
+
+	xa_for_each(&scm->waitq, index, c) {
+		xa_erase(&scm->waitq, index);
+		kfree(c);
+	}
+
+	xa_destroy(&scm->waitq);
 }
 
 static const struct of_device_id qcom_scm_dt_match[] = {
