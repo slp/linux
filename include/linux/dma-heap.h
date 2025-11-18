@@ -11,6 +11,7 @@
 
 #include <linux/types.h>
 
+struct cma;
 struct dma_heap;
 
 /**
@@ -42,8 +43,34 @@ struct dma_heap_export_info {
 
 void *dma_heap_get_drvdata(struct dma_heap *heap);
 
+/**
+ * dma_heap_get_dev() - get device struct for the heap
+ * @heap: DMA-Heap to retrieve device struct from
+ *
+ * Returns:
+ * The device struct for the heap.
+ */
+struct device *dma_heap_get_dev(struct dma_heap *heap);
+
 const char *dma_heap_get_name(struct dma_heap *heap);
 
 struct dma_heap *dma_heap_add(const struct dma_heap_export_info *exp_info);
+
+struct dma_heap *dma_heap_find(const char *name);
+
+void dma_heap_put(struct dma_heap *heap);
+
+struct dma_buf *dma_heap_buffer_alloc(struct dma_heap *heap, size_t len,
+				      u32 fd_flags,
+				      u64 heap_flags);
+
+#ifdef CONFIG_DMABUF_HEAPS_CMA
+int cma_heap_add(struct cma *cma, void *data);
+#else
+static inline int cma_heap_add(struct cma *cma, void *data)
+{
+	return -EINVAL;
+}
+#endif /* CONFIG_DMABUF_HEAPS_CMA */
 
 #endif /* _DMA_HEAPS_H */
