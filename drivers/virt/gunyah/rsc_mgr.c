@@ -849,7 +849,8 @@ static int gh_rm_drv_probe(struct platform_device *pdev)
 		goto err_msgq;
 	}
 
-	rm->irq_domain = irq_domain_add_hierarchy(parent_irq_domain, 0, 0, pdev->dev.of_node,
+	rm->irq_domain = irq_domain_create_hierarchy(parent_irq_domain, 0, 0,
+							of_fwnode_handle(pdev->dev.of_node),
 							&gh_rm_irq_domain_ops, NULL);
 	if (!rm->irq_domain) {
 		dev_err(&pdev->dev, "Failed to add irq domain\n");
@@ -877,7 +878,7 @@ err_cache:
 	return ret;
 }
 
-static int gh_rm_drv_remove(struct platform_device *pdev)
+static void gh_rm_drv_remove(struct platform_device *pdev)
 {
 	struct gh_rm *rm = platform_get_drvdata(pdev);
 
@@ -885,8 +886,6 @@ static int gh_rm_drv_remove(struct platform_device *pdev)
 	irq_domain_remove(rm->irq_domain);
 	gh_msgq_remove(&rm->msgq);
 	kmem_cache_destroy(rm->cache);
-
-	return 0;
 }
 
 static const struct of_device_id gh_rm_of_match[] = {
