@@ -154,26 +154,28 @@ static struct dc_node *dc_new_node(struct fuse_defer *dc, u64 host)
 	return n;
 }
 
-static u32 dc_name_hash(struct dc_node *dir, const char *name)
+static u32 dc_name_hash(struct dc_node *dir, const char *name, size_t len)
 {
-	return full_name_hash(dir, name, strlen(name));
+	return full_name_hash(dir, name, len);
 }
 
 static struct dc_entry *dc_entry(struct fuse_defer *dc, struct dc_node *dir,
-				 const char *name)
+				 const char *name, size_t len)
 {
 	struct dc_entry *e;
-	u32 key = dc_name_hash(dir, name);
+	u32 key = dc_name_hash(dir, name, len);
 
 	hash_for_each_possible(dc->names, e, hash, key)
-		if (e->parent == dir && !strcmp(e->name, name))
+		if (e->parent == dir && strlen(e->name) == len &&
+		    !memcmp(e->name, name, len))
 			return e;
-	e = dc_alloc(dc, sizeof(*e) + strlen(name) + 1);
+	e = dc_alloc(dc, sizeof(*e) + len + 1);
 	if (!e)
 		return NULL;
 	e->parent = dir;
 	e->cookie = ++dir->cookie;
-	strscpy(e->name, name, strlen(name) + 1);
+	memcpy(e->name, name, len);
+	e->name[len] = '\0';
 	hash_add(dc->names, &e->hash, key);
 	list_add_tail(&e->list, &dir->children);
 	return e;
@@ -242,11 +244,11 @@ static int dc_getattr(struct fuse_defer *dc, struct dc_node *n,
 }
 
 static int dc_lookup(struct fuse_defer *dc, struct dc_node *dir,
-		     const char *name, const struct fuse_args *src,
+		     const char *name, size_t len, const struct fuse_args *src,
 		     struct dc_entry **entry)
 {
 	struct fuse_entry_out out = {};
-	struct dc_entry *e = dc_entry(dc, dir, name);
+	struct dc_entry *e = dc_entry(dc, dir, name, len);
 	struct dc_node *n;
 
 	FUSE_ARGS(a);
@@ -263,8 +265,10 @@ static int dc_lookup(struct fuse_defer *dc, struct dc_node *dir,
 	if (!dir->host)
 		return 0;
 	dc_args(&a, src, dir, FUSE_LOOKUP);
-	a.in_numargs = 1;
-	a.in_args[0] = (struct fuse_in_arg){ strlen(name) + 1, name };
+	a.in_numargs = 3;
+	fuse_set_zero_arg0(&a);
+	a.in_args[1] = (struct fuse_in_arg){ len, e->name };
+	a.in_args[2] = (struct fuse_in_arg){ 1, "" };
 	a.out_numargs = 1;
 	a.out_args[0] = (struct fuse_arg){ sizeof(out), &out };
 	err = dc_send(dc, &a);
@@ -368,6 +372,8 @@ static struct dc_op *dc_save(struct fuse_defer *dc, struct fuse_args *a,
 	op->node = n;
 	p = op->data;
 	for (i = 0; i < a->in_numargs; i++) {
+		if (!a->in_args[i].size)
+			continue;
 		if (a->in_pages && i == a->in_numargs - 1)
 			dc_copy_pages(a, p, a->in_args[i].size, false);
 		else
@@ -495,7 +501,7 @@ static int dc_load_dir(struct fuse_defer *dc, struct dc_node *n,
 			off += len;
 			if (!strcmp(name, ".") || !strcmp(name, ".."))
 				continue;
-			e = dc_entry(dc, n, name);
+			e = dc_entry(dc, n, name, de->namelen);
 			if (!e) {
 				err = dc->alloc_error;
 				goto close;
@@ -897,15 +903,13 @@ static int dc_create(struct fuse_defer *dc, struct dc_node *dir,
 	struct dc_entry *e;
 	struct dc_node *n;
 	struct dc_op *op;
-	const char *name;
+	const char *name = a->in_args[1].value;
 	u32 mode, rdev = 0;
 	int err;
 
 	if (a->opcode == FUSE_SYMLINK) {
 		mode = S_IFLNK | 0777;
-		name = a->in_args[0].value;
 	} else {
-		name = a->in_args[1].value;
 		switch (a->opcode) {
 		case FUSE_CREATE:
 			mode = ((const struct fuse_create_in *)a->in_args[0].value)->mode;
@@ -919,7 +923,7 @@ static int dc_create(struct fuse_defer *dc, struct dc_node *dir,
 			rdev = ((const struct fuse_mknod_in *)a->in_args[0].value)->rdev;
 		}
 	}
-	err = dc_lookup(dc, dir, name, a, &e);
+	err = dc_lookup(dc, dir, name, strlen(name), a, &e);
 	if (err)
 		return err;
 	if (e->present)
@@ -933,7 +937,7 @@ static int dc_create(struct fuse_defer *dc, struct dc_node *dir,
 		return dc->alloc_error;
 	}
 	if (a->opcode == FUSE_SYMLINK) {
-		n->symlink = dc_string(dc, a->in_args[1].value);
+		n->symlink = dc_string(dc, a->in_args[2].value);
 		if (!n->symlink) {
 			dc_free(dc, op);
 			return dc->alloc_error;
@@ -982,7 +986,8 @@ static int dc_unlink(struct fuse_defer *dc, struct dc_node *dir,
 	struct dc_entry *e, *child;
 	struct dc_op *op;
 	struct dc_node *n;
-	int err = dc_lookup(dc, dir, a->in_args[1].value, a, &e);
+	const char *name = a->in_args[1].value;
+	int err = dc_lookup(dc, dir, name, strlen(name), a, &e);
 
 	if (err)
 		return err;
@@ -1032,12 +1037,14 @@ static int dc_rename(struct fuse_defer *dc, struct dc_node *dir,
 
 	if (!newdir || flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE))
 		return -EOPNOTSUPP;
-	err = dc_lookup(dc, dir, a->in_args[1].value, a, &old);
+	err = dc_lookup(dc, dir, a->in_args[1].value,
+			strlen(a->in_args[1].value), a, &old);
 	if (err)
 		return err;
 	if (!old->present)
 		return -ENOENT;
-	err = dc_lookup(dc, newdir, a->in_args[2].value, a, &new);
+	err = dc_lookup(dc, newdir, a->in_args[2].value,
+			strlen(a->in_args[2].value), a, &new);
 	if (err)
 		return err;
 	if (old == new || (new->present && old->node == new->node))
@@ -1114,7 +1121,8 @@ static int dc_link(struct fuse_defer *dc, struct dc_node *dir, struct fuse_args 
 
 	if (!n)
 		return -ESTALE;
-	err = dc_lookup(dc, dir, a->in_args[1].value, a, &e);
+	err = dc_lookup(dc, dir, a->in_args[1].value,
+			strlen(a->in_args[1].value), a, &e);
 	if (err)
 		return err;
 	if (e->present)
@@ -1303,17 +1311,20 @@ static ssize_t dc_request(struct fuse_defer *dc, struct fuse_args *a)
 		return 0;
 	case FUSE_LOOKUP: {
 		struct dc_entry *e;
-		const char *name = a->in_args[0].value;
+		const char *name = a->in_args[1].value;
+		size_t len = a->in_args[1].size;
 
-		if (!strcmp(name, ".") || !strcmp(name, "..")) {
-			struct dc_node *target = !strcmp(name, ".") ? n : dc_node(dc, n->parent);
+		/* LOOKUP passes a counted name and a separate terminating NUL. */
+		if ((len == 1 && name[0] == '.') ||
+		    (len == 2 && name[0] == '.' && name[1] == '.')) {
+			struct dc_node *target = len == 1 ? n : dc_node(dc, n->parent);
 
 			if (!target)
 				return -ESTALE;
 			dc_entry_out(target, a->out_args[0].value);
 			return 0;
 		}
-		err = dc_lookup(dc, n, name, a, &e);
+		err = dc_lookup(dc, n, name, len, a, &e);
 		if (!err)
 			dc_entry_out(e->present ? e->node : NULL, a->out_args[0].value);
 		return err;

@@ -8,6 +8,8 @@ struct dc_test_state {
 	u64 next_host;
 	char disk[128];
 	size_t disk_size;
+	char symlink_name[32];
+	char symlink_target[128];
 };
 
 static struct fuse_attr dc_test_attr(u64 id)
@@ -37,15 +39,23 @@ static ssize_t dc_test_send(struct fuse_chan *chan, struct fuse_args *a)
 	case FUSE_LOOKUP: {
 		struct fuse_entry_out *out = a->out_args[0].value;
 
-		if (strcmp(a->in_args[0].value, "base"))
+		if (a->in_numargs != 3 || a->in_args[0].size || a->in_args[0].value ||
+		    a->in_args[2].size != 1 || memcmp(a->in_args[2].value, "", 1))
+			return -EINVAL;
+		if (a->in_args[1].size != 4 || memcmp(a->in_args[1].value, "base", 4))
 			return -ENOENT;
 		*out = (struct fuse_entry_out){ .nodeid = 100, .attr = dc_test_attr(100) };
 		return 0;
 	}
+	case FUSE_SYMLINK:
+		if (a->in_numargs != 3 || a->in_args[0].size || a->in_args[0].value)
+			return -EINVAL;
+		strscpy(s->symlink_name, a->in_args[1].value, sizeof(s->symlink_name));
+		strscpy(s->symlink_target, a->in_args[2].value, sizeof(s->symlink_target));
+		fallthrough;
 	case FUSE_CREATE:
 	case FUSE_MKNOD:
-	case FUSE_MKDIR:
-	case FUSE_SYMLINK: {
+	case FUSE_MKDIR: {
 		struct fuse_entry_out *out = a->out_args[0].value;
 		u64 host = ++s->next_host;
 
@@ -146,21 +156,30 @@ static void dc_test_exit(struct kunit *test)
 	fuse_defer_destroy(&s->fc);
 }
 
-static u64 dc_test_lookup(struct kunit *test, const char *name)
+static u64 dc_test_lookup_name(struct kunit *test, const struct qstr *name)
 {
 	struct dc_test_state *s = test->priv;
-	struct fuse_entry_out out;
+	struct fuse_entry_out out = {};
 
 	FUSE_ARGS(a);
 
 	a.opcode = FUSE_LOOKUP;
 	a.nodeid = 1;
-	a.in_numargs = 1;
-	a.in_args[0] = (struct fuse_in_arg){ strlen(name) + 1, name };
+	a.in_numargs = 3;
+	fuse_set_zero_arg0(&a);
+	a.in_args[1] = (struct fuse_in_arg){ name->len, name->name };
+	a.in_args[2] = (struct fuse_in_arg){ 1, "" };
 	a.out_numargs = 1;
 	a.out_args[0] = (struct fuse_arg){ sizeof(out), &out };
 	KUNIT_EXPECT_EQ(test, fuse_defer_request(&s->fc, &a), 0);
 	return out.nodeid;
+}
+
+static u64 dc_test_lookup(struct kunit *test, const char *name)
+{
+	const struct qstr qstr = QSTR_INIT(name, strlen(name));
+
+	return dc_test_lookup_name(test, &qstr);
 }
 
 static u64 dc_test_create(struct kunit *test, const char *name)
@@ -251,6 +270,69 @@ static void dc_cached_attributes(struct kunit *test)
 	}
 	KUNIT_EXPECT_EQ(test, s->calls[FUSE_GETATTR], 1);
 	KUNIT_EXPECT_EQ(test, s->calls[FUSE_LOOKUP], 2);
+}
+
+static void dc_lookup_uses_counted_names(struct kunit *test)
+{
+	struct dc_test_state *s = test->priv;
+	const struct qstr names[] = {
+		QSTR_INIT("base/suffix", 4),
+		QSTR_INIT("absent/suffix", 6),
+		QSTR_INIT("./suffix", 1),
+		QSTR_INIT("../suffix", 2),
+	};
+	u64 id = dc_test_lookup_name(test, &names[0]);
+
+	KUNIT_ASSERT_NE(test, id, 0);
+	KUNIT_EXPECT_EQ(test, dc_test_lookup(test, "base"), id);
+	KUNIT_EXPECT_EQ(test, dc_test_lookup_name(test, &names[1]), 0);
+	KUNIT_EXPECT_EQ(test, dc_test_lookup(test, "absent"), 0);
+	KUNIT_EXPECT_EQ(test, dc_test_lookup_name(test, &names[2]), FUSE_ROOT_ID);
+	KUNIT_EXPECT_EQ(test, dc_test_lookup_name(test, &names[3]), FUSE_ROOT_ID);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_LOOKUP], 2);
+}
+
+static void dc_symlink_uses_zero_header_layout(struct kunit *test)
+{
+	struct dc_test_state *s = test->priv;
+	struct fuse_entry_out out = {};
+	char name[] = "link", target[] = "base/target";
+	char buffer[32];
+
+	FUSE_ARGS(a);
+	FUSE_ARGS(read);
+
+	a.opcode = FUSE_SYMLINK;
+	a.nodeid = FUSE_ROOT_ID;
+	a.in_numargs = 3;
+	fuse_set_zero_arg0(&a);
+	a.in_args[1] = (struct fuse_in_arg){ sizeof(name), name };
+	a.in_args[2] = (struct fuse_in_arg){ sizeof(target), target };
+	a.out_numargs = 1;
+	a.out_args[0] = (struct fuse_arg){ sizeof(out), &out };
+	KUNIT_ASSERT_EQ(test, fuse_defer_request(&s->fc, &a), 0);
+	KUNIT_ASSERT_NE(test, out.nodeid, 0);
+	KUNIT_EXPECT_EQ(test, out.attr.mode, S_IFLNK | 0777);
+	KUNIT_EXPECT_EQ(test, out.attr.size, strlen("base/target"));
+	memset(name, 'x', sizeof(name) - 1);
+	memset(target, 'x', sizeof(target) - 1);
+	KUNIT_EXPECT_EQ(test, dc_test_lookup(test, "link"), out.nodeid);
+	read.opcode = FUSE_READLINK;
+	read.nodeid = out.nodeid;
+	read.out_numargs = 1;
+	read.out_args[0] = (struct fuse_arg){ sizeof(buffer), buffer };
+	read.out_argvar = true;
+	KUNIT_EXPECT_EQ(test, fuse_defer_request(&s->fc, &read), strlen("base/target"));
+	KUNIT_EXPECT_MEMEQ(test, buffer, "base/target", strlen("base/target"));
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_SYMLINK], 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_READLINK], 0);
+	KUNIT_ASSERT_EQ(test, dc_test_commit(test, FUSE_FSYNCDIR), 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_SYMLINK], 1);
+	KUNIT_EXPECT_STREQ(test, s->symlink_name, "link");
+	KUNIT_EXPECT_STREQ(test, s->symlink_target, "base/target");
+	KUNIT_EXPECT_EQ(test, fuse_defer_request(&s->fc, &read), strlen("base/target"));
+	KUNIT_EXPECT_MEMEQ(test, buffer, "base/target", strlen("base/target"));
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_READLINK], 0);
 }
 
 static void dc_cached_xattrs(struct kunit *test)
@@ -442,6 +524,8 @@ static void dc_unrecognized_mutation_never_reaches_host(struct kunit *test)
 
 static struct kunit_case dc_tests[] = {
 	KUNIT_CASE(dc_cached_attributes),
+	KUNIT_CASE(dc_lookup_uses_counted_names),
+	KUNIT_CASE(dc_symlink_uses_zero_header_layout),
 	KUNIT_CASE(dc_cached_xattrs),
 	KUNIT_CASE(dc_deferred_mutations),
 	KUNIT_CASE(dc_failed_replay_is_retryable),
