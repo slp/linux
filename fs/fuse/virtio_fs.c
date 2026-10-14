@@ -22,6 +22,7 @@
 #include <linux/uio.h>
 #include "dev.h"
 #include "fuse_i.h"
+#include "defer.h"
 #include "fuse_dev_i.h"
 
 /* Used to help calculate the FUSE connection's max_pages limit for a request's
@@ -73,6 +74,7 @@ struct virtio_fs {
 	unsigned int nvqs;               /* number of virtqueues */
 	unsigned int num_request_queues; /* number of request queues */
 	unsigned int num_sync_queues;    /* number of per-CPU synchronous queues */
+	bool deferred_writeback;
 	struct dax_device *dax_dev;
 
 	unsigned int *mq_map; /* index = cpu id, value = request vq id */
@@ -1176,6 +1178,8 @@ static int virtio_fs_probe(struct virtio_device *vdev)
 		return -ENOMEM;
 	kobject_init(&fs->kobj, &virtio_fs_ktype);
 	vdev->priv = fs;
+	fs->deferred_writeback = virtio_has_feature(vdev,
+					VIRTIO_FS_F_DEFERRED_WRITEBACK);
 
 	ret = virtio_fs_read_tag(vdev, fs);
 	if (ret < 0)
@@ -1269,6 +1273,7 @@ static const struct virtio_device_id id_table[] = {
 
 static const unsigned int feature_table[] = {
 	VIRTIO_FS_F_SYNC,
+	VIRTIO_FS_F_DEFERRED_WRITEBACK,
 };
 
 static struct virtio_driver virtio_fs_driver = {
@@ -1291,6 +1296,11 @@ static void virtio_fs_send_forget(struct fuse_iqueue *fiq, struct fuse_forget_li
 	struct virtio_fs *fs = fiq->priv;
 	struct virtio_fs_vq *fsvq = &fs->vqs[VQ_HIPRIO];
 	u64 unique = fuse_get_unique(fiq);
+
+	if (fs->deferred_writeback) {
+		kfree(link);
+		return;
+	}
 
 	/* Allocate a buffer for the request */
 	forget = kmalloc_obj(*forget, GFP_NOFS | __GFP_NOFAIL);
@@ -1608,6 +1618,15 @@ static int virtio_fs_fill_super(struct super_block *sb, struct fs_context *fsc)
 	int err;
 
 	virtio_fs_ctx_set_defaults(ctx);
+	if (fs->deferred_writeback) {
+		if (ctx->dax_mode == FUSE_DAX_ALWAYS)
+			return -EINVAL;
+		ctx->dax_mode = FUSE_DAX_NEVER;
+		fc->auto_submounts = false;
+		err = fuse_defer_init(fc);
+		if (err)
+			return err;
+	}
 	mutex_lock(&virtio_fs_mutex);
 
 	/* After holding mutex, make sure virtiofs device is still there.
@@ -1699,6 +1718,12 @@ static void virtio_kill_sb(struct super_block *sb)
 
 	/* If mount failed, we can still be called without any fc */
 	if (sb->s_root) {
+		if (fm->fc->defer) {
+			int err = sync_filesystem(sb);
+
+			if (err)
+				pr_err("virtio-fs: deferred commit failed during unmount: %d\n", err);
+		}
 		last = fuse_mount_remove(fm);
 		if (last)
 			virtio_fs_conn_destroy(fm);

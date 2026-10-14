@@ -76,3 +76,8 @@ config FUSE_IO_URING
 
 	  If you want to allow fuse server/client communication through io-uring,
 	  answer Y
+
+config FUSE_DEFER_KUNIT_TEST
+	bool "KUnit tests for deferred virtio-fs caching" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && FUSE_FS=y
+	default KUNIT_ALL_TESTS

@@ -68,6 +68,7 @@ extern unsigned int max_user_bgreq;
 extern unsigned int max_user_congthresh;
 
 struct fuse_forget_link;
+struct fuse_defer;
 
 /**
  * struct fuse_submount_lookup - Submount lookup tracking
@@ -467,6 +468,7 @@ struct fuse_conn {
 
 	/** @chan: transport layer object */
 	struct fuse_chan *chan;
+	struct fuse_defer *defer;
 
 	/** @khctr: The next unique kernel file handle */
 	atomic64_t khctr;

@@ -5,6 +5,7 @@
 */
 
 #include "fuse_i.h"
+#include "defer.h"
 #include "dev.h"
 
 #include <linux/pagemap.h>
@@ -543,6 +544,9 @@ static int fuse_fsync(struct file *file, loff_t start, loff_t end,
 	struct inode *inode = file->f_mapping->host;
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	int err;
+
+	if (fc->defer)
+		return fuse_defer_sync(inode->i_sb);
 
 	if (fuse_is_bad(inode))
 		return -EIO;

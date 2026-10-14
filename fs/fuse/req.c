@@ -2,6 +2,7 @@
 
 #include "dev.h"
 #include "fuse_i.h"
+#include "defer.h"
 
 static int fuse_fill_creds(struct fuse_mount *fm, struct fuse_args *args, struct mnt_idmap *idmap)
 {
@@ -66,6 +67,8 @@ ssize_t __fuse_simple_request(struct mnt_idmap *idmap, struct fuse_mount *fm,
 	if (err)
 		return err;
 
+	if (fc->defer && args->opcode != FUSE_INIT)
+		return fuse_defer_request(fc, args);
 	return fuse_chan_send(fc->chan, args);
 }
 
@@ -80,6 +83,8 @@ int fuse_simple_background(struct fuse_mount *fm, struct fuse_args *args, gfp_t 
 	if (err)
 		return err;
 
+	if (fc->defer && args->opcode != FUSE_INIT)
+		return fuse_defer_background(fc, args, gfp_flags);
 	return fuse_chan_send_bg(fc->chan, args, gfp_flags);
 }
 EXPORT_SYMBOL_GPL(fuse_simple_background);

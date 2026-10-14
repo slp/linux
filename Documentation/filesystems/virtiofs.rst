@@ -98,6 +98,62 @@ completion immediately.  The driver always notifies synchronous queues,
 regardless of event suppression.  The queue identifies synchronous requests;
 the FUSE request header retains its original layout and padding.
 
+Deferred guest writeback (experimental)
+---------------------------------------
+
+``VIRTIO_FS_F_DEFERRED_WRITEBACK`` (experimental bit 2) permits a guest to keep
+filesystem mutations entirely in guest memory until an explicit checkpoint.
+It is independent of ``VIRTIO_FS_F_SYNC``. Both the device and the driver must
+negotiate it; devices must not offer it by default. The libkrun filesystem API
+offers it through ``FsDevice::set_deferred_writeback(true)`` or the equivalent
+``krun_fs_device_set_deferred_writeback()`` C function.
+
+The guest must exclusively own the exported directory. Concurrent host writers,
+other guests, cache invalidations, and cross-domain file descriptor export are
+not supported. Cached attributes and positive and negative name and xattr
+lookups are authoritative until unmount. Local mutations update these cached
+results without revalidating them on the host. Cached directory contents and
+symlink targets are also retained. Cold reads can still require host requests.
+
+File data uses the guest page cache. Background writeback and close move dirty
+data into the guest journal, not to the host. The journal also records create,
+mkdir, mknod, symlink, link, unlink, rmdir, rename, setattr, setxattr and
+removexattr operations. Files created locally have stable guest inode IDs, which
+are mapped to host node IDs when their creation is replayed. Unknown operations
+are rejected rather than forwarded, so they cannot silently bypass the journal.
+In particular, this initial implementation does not support tmpfile, fallocate,
+copy-file-range, filesystem ioctls, or direct host mappings. Applications must
+use ordinary read/write and named-file creation paths instead.
+The libkrun init exit-status ioctl remains available because it does not mutate
+the filesystem; normal shutdown subsequently issues ``sync()``.
+
+``fsync()`` and directory ``fsync()`` checkpoint the whole mount, including the
+page cache of other files. ``sync()``, ``syncfs()`` and clean unmount also
+checkpoint. The journal is replayed in order, followed by host fsyncs of affected
+files and directories. A completed journal operation is not replayed again if a
+later operation fails. Dirty durability state is retained after host fsync
+failure so a subsequent checkpoint can retry. A checkpoint is not an atomic
+transaction: host-visible changes may be partially applied on error or crash.
+
+The ``fuse.deferred_cache_mb`` parameter sets the per-mount cache and journal
+budget, in MiB (default 256). Namespace/inode and xattr records are pinned for
+the mount lifetime in this initial implementation; successful commits free the
+journal, but not these records. Cache exhaustion returns ``ENOSPC`` and memory
+allocation failures return ``ENOMEM``; neither triggers an implicit commit.
+If buffered data could not be retained, subsequent checkpoints continue to
+report the write error rather than claim that the data was made durable.
+
+Uncommitted changes are lost on guest crash or forced teardown. Clean-unmount
+commit failures are logged, but teardown cannot preserve an in-memory journal.
+DAX, read-only exports, NullFs exports and context-dependent permission
+semantics are incompatible with this mode. There is no change to normal FUSE
+or virtio-fs behavior when the feature is not negotiated.
+
+``CONFIG_FUSE_DEFER_KUNIT_TEST`` builds request-level cache and replay tests.
+``fs/fuse/defer.config`` provides a Kconfig fragment for these tests. They verify
+that repeated getattr and getxattr requests, including absent xattrs, do not
+reach the backend, and cover deferred writes, commit retries and cache limits.
+
 Without ``VIRTIO_FS_F_SYNC``, the driver does not read ``num_sync_queues`` or
 initialize synchronous queues, and retains the original queue routing and
 completion handling.

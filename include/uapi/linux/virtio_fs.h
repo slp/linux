@@ -10,6 +10,8 @@
 
 /* Synchronous request queues (bit 0 is reserved for notifications). */
 #define VIRTIO_FS_F_SYNC 1
+/* Exclusive guest ownership and guest-local, explicitly committed mutations. */
+#define VIRTIO_FS_F_DEFERRED_WRITEBACK 2
 
 struct virtio_fs_config {
 	/* Filesystem name (UTF-8, not NUL-terminated, padded with NULs) */

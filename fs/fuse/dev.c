@@ -95,6 +95,18 @@ static bool fuse_block_alloc(struct fuse_chan *fch, bool for_background)
 	       (fch->io_uring && fch->connected && !fuse_uring_ready(fch));
 }
 
+int fuse_chan_wait_initialized(struct fuse_chan *fch)
+{
+	int err;
+
+	err = wait_event_killable(fch->blocked_waitq,
+				 smp_load_acquire(&fch->initialized) ||
+				 !READ_ONCE(fch->connected));
+	if (err)
+		return err;
+	return READ_ONCE(fch->connected) ? 0 : -ENOTCONN;
+}
+
 static void fuse_drop_waiting(struct fuse_chan *fch)
 {
 	/*

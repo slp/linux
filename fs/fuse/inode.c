@@ -6,6 +6,7 @@
 
 #include "dev.h"
 #include "fuse_i.h"
+#include "defer.h"
 
 #include <linux/dax.h>
 #include <linux/pagemap.h>
@@ -1019,6 +1020,7 @@ void fuse_conn_put(struct fuse_conn *fc)
 	}
 	if (IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
 		fuse_backing_files_free(fc);
+	fuse_defer_destroy(fc);
 	call_rcu(&fc->rcu, delayed_release);
 }
 EXPORT_SYMBOL_GPL(fuse_conn_put);
@@ -1425,6 +1427,13 @@ static void process_init_reply(struct fuse_args *args, int error)
 		fc->max_write = arg->minor < 5 ? 4096 : arg->max_write;
 		fc->max_write = max_t(unsigned, 4096, fc->max_write);
 		fc->conn_init = 1;
+		if (fc->defer) {
+			fc->writeback_cache = 1;
+			fc->auto_inval_data = 0;
+			fc->do_readdirplus = 0;
+			fc->readdirplus_auto = 0;
+			fc->cache_symlinks = 1;
+		}
 	}
 	kfree(ia);
 
@@ -1469,6 +1478,9 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
 		FUSE_HAS_EXPIRE_ONLY | FUSE_DIRECT_IO_ALLOW_MMAP |
 		FUSE_NO_EXPORT_SUPPORT | FUSE_HAS_RESEND | FUSE_ALLOW_IDMAP |
 		FUSE_REQUEST_TIMEOUT;
+	if (fm->fc->defer)
+		flags &= ~(FUSE_HANDLE_KILLPRIV | FUSE_HANDLE_KILLPRIV_V2 |
+			   FUSE_SECURITY_CTX | FUSE_PASSTHROUGH);
 #ifdef CONFIG_FUSE_DAX
 	if (fm->fc->dax)
 		flags |= FUSE_MAP_ALIGNMENT;
