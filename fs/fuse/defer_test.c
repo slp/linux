@@ -10,6 +10,7 @@ struct dc_test_state {
 	size_t disk_size;
 	char symlink_name[32];
 	char symlink_target[128];
+	bool server_looked_up, server_open, server_released;
 };
 
 static struct fuse_attr dc_test_attr(u64 id)
@@ -33,6 +34,8 @@ static ssize_t dc_test_send(struct fuse_chan *chan, struct fuse_args *a)
 	case FUSE_GETATTR: {
 		struct fuse_attr_out *out = a->out_args[0].value;
 
+		if (a->nodeid == 200 && s->server_released)
+			return -ENOENT;
 		*out = (struct fuse_attr_out){ .attr = dc_test_attr(a->nodeid) };
 		return 0;
 	}
@@ -42,6 +45,23 @@ static ssize_t dc_test_send(struct fuse_chan *chan, struct fuse_args *a)
 		if (a->in_numargs != 3 || a->in_args[0].size || a->in_args[0].value ||
 		    a->in_args[2].size != 1 || memcmp(a->in_args[2].value, "", 1))
 			return -EINVAL;
+		if ((a->in_args[1].size == 9 &&
+		     !memcmp(a->in_args[1].value, "init.krun", 9)) ||
+		    (a->in_args[1].size == 7 &&
+		     !memcmp(a->in_args[1].value, "virtual", 7))) {
+			bool one_shot = a->in_args[1].size == 9;
+
+			if (one_shot && s->server_looked_up)
+				return -ENOENT;
+			s->server_looked_up = true;
+			*out = (struct fuse_entry_out){
+				.nodeid = 200, .entry_valid = one_shot ? 0 : DC_TIMEOUT,
+				.attr = dc_test_attr(200),
+			};
+			out->attr.size = s->disk_size;
+			out->attr.flags = FUSE_ATTR_SERVER_OWNED;
+			return 0;
+		}
 		if (a->in_args[1].size != 4 || memcmp(a->in_args[1].value, "base", 4))
 			return -ENOENT;
 		*out = (struct fuse_entry_out){ .nodeid = 100, .attr = dc_test_attr(100) };
@@ -67,6 +87,14 @@ static ssize_t dc_test_send(struct fuse_chan *chan, struct fuse_args *a)
 	}
 	case FUSE_OPEN:
 	case FUSE_OPENDIR:
+		if (a->nodeid == 200) {
+			if (s->server_released)
+				return -ENOENT;
+			s->server_open = true;
+			*(struct fuse_open_out *)a->out_args[0].value =
+				(struct fuse_open_out){ .fh = 900 };
+			return 0;
+		}
 		*(struct fuse_open_out *)a->out_args[0].value =
 			(struct fuse_open_out){ .fh = a->nodeid };
 		return 0;
@@ -75,8 +103,20 @@ static ssize_t dc_test_send(struct fuse_chan *chan, struct fuse_args *a)
 		size_t size = in->offset >= s->disk_size ? 0 :
 			min_t(size_t, in->size, s->disk_size - in->offset);
 
+		if (a->nodeid == 200 &&
+		    (!s->server_open || s->server_released || in->fh != 900 || a->end))
+			return -EBADF;
 		return dc_output(a, s->disk + min_t(u64, in->offset, sizeof(s->disk)), size);
 	}
+	case FUSE_RELEASE:
+		if (a->nodeid == 200) {
+			const struct fuse_release_in *in = a->in_args[0].value;
+
+			if (in->fh != 900)
+				return -EBADF;
+			s->server_released = true;
+		}
+		return 0;
 	case FUSE_WRITE: {
 		const struct fuse_write_in *in = a->in_args[0].value;
 		struct fuse_write_out *out = a->out_args[0].value;
@@ -335,6 +375,177 @@ static void dc_symlink_uses_zero_header_layout(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, s->calls[FUSE_READLINK], 0);
 }
 
+static void dc_server_owned_open_lifecycle(struct kunit *test)
+{
+	struct dc_test_state *s = test->priv;
+	struct fuse_entry_out entry = {};
+	struct fuse_open_in in = { .flags = O_RDONLY };
+	struct fuse_open_out out = {};
+	struct fuse_read_in rd = { .size = 2 };
+	struct fuse_release_in rel = {};
+	char buffer[4];
+	u64 id;
+
+	FUSE_ARGS(lookup);
+	FUSE_ARGS(open);
+	FUSE_ARGS(read);
+	FUSE_ARGS(release);
+
+	lookup.opcode = FUSE_LOOKUP;
+	lookup.nodeid = FUSE_ROOT_ID;
+	lookup.in_numargs = 3;
+	fuse_set_zero_arg0(&lookup);
+	lookup.in_args[1] = (struct fuse_in_arg){ 9, "init.krun" };
+	lookup.in_args[2] = (struct fuse_in_arg){ 1, "" };
+	lookup.out_numargs = 1;
+	lookup.out_args[0] = (struct fuse_arg){ sizeof(entry), &entry };
+	KUNIT_ASSERT_EQ(test, fuse_defer_request(&s->fc, &lookup), 0);
+	id = entry.nodeid;
+	KUNIT_ASSERT_NE(test, id, 0);
+	KUNIT_EXPECT_EQ(test, entry.entry_valid, 0);
+	KUNIT_EXPECT_EQ(test, entry.attr_valid, 0);
+	KUNIT_EXPECT_EQ(test, entry.attr.flags & FUSE_ATTR_SERVER_OWNED, 0);
+	open.opcode = FUSE_OPEN;
+	open.nodeid = id;
+	open.in_numargs = 1;
+	open.in_args[0] = (struct fuse_in_arg){ sizeof(in), &in };
+	open.out_numargs = 1;
+	open.out_args[0] = (struct fuse_arg){ sizeof(out), &out };
+	KUNIT_ASSERT_EQ(test, fuse_defer_request(&s->fc, &open), 0);
+	KUNIT_EXPECT_EQ(test, out.fh, 900);
+	rd.fh = out.fh;
+	read.opcode = FUSE_READ;
+	read.nodeid = id;
+	read.in_numargs = 1;
+	read.in_args[0] = (struct fuse_in_arg){ sizeof(rd), &rd };
+	read.out_numargs = 1;
+	read.out_args[0] = (struct fuse_arg){ 2, buffer };
+	read.out_argvar = true;
+	KUNIT_ASSERT_EQ(test, fuse_defer_request(&s->fc, &read), 2);
+	KUNIT_EXPECT_EQ(test, dc_test_lookup(test, "init.krun"), 0);
+	rd.offset = 2;
+	read.out_args[0] = (struct fuse_arg){ 2, buffer + 2 };
+	KUNIT_ASSERT_EQ(test, fuse_defer_request(&s->fc, &read), 2);
+	KUNIT_EXPECT_MEMEQ(test, buffer, "seed", 4);
+	KUNIT_EXPECT_FALSE(test, s->server_released);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_OPEN], 1);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_READ], 2);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_RELEASE], 0);
+	rel.fh = out.fh;
+	release.opcode = FUSE_RELEASE;
+	release.nodeid = id;
+	release.in_numargs = 1;
+	release.in_args[0] = (struct fuse_in_arg){ sizeof(rel), &rel };
+	KUNIT_ASSERT_EQ(test, fuse_defer_request(&s->fc, &release), 0);
+	KUNIT_EXPECT_TRUE(test, s->server_released);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_RELEASE], 1);
+	KUNIT_EXPECT_EQ(test, dc_test_lookup(test, "init.krun"), 0);
+	KUNIT_EXPECT_EQ(test, dc_test_commit(test, FUSE_SYNCFS), 0);
+	KUNIT_EXPECT_TRUE(test, list_empty(&s->fc.defer->journal));
+}
+
+static void dc_test_end(struct fuse_args *args, int error)
+{
+}
+
+static void dc_server_owned_page_reads(struct kunit *test)
+{
+	struct dc_test_state *s = test->priv;
+	u64 id = dc_test_lookup(test, "virtual");
+	struct fuse_read_in in = { .fh = 900, .size = PAGE_SIZE };
+	struct fuse_folio_desc desc = { .length = PAGE_SIZE };
+	struct folio *folio = folio_alloc(GFP_KERNEL, 0);
+	struct fuse_args_pages ap = {
+		.args = {
+			.nodeid = id, .opcode = FUSE_READ, .in_numargs = 1,
+			.in_args[0] = { sizeof(in), &in },
+			.out_numargs = 1, .out_args[0].size = PAGE_SIZE,
+			.out_argvar = true, .out_pages = true, .page_zeroing = true,
+			.end = dc_test_end,
+		},
+		.num_folios = 1, .folios = &folio, .descs = &desc,
+	};
+	char buffer[8];
+	void *addr;
+
+	KUNIT_ASSERT_NOT_NULL(test, folio);
+	s->server_open = true;
+	addr = kmap_local_folio(folio, 0);
+	memset(addr, 0x55, PAGE_SIZE);
+	kunmap_local(addr);
+	KUNIT_EXPECT_EQ(test, fuse_defer_request(&s->fc, &ap.args), 4);
+	KUNIT_EXPECT_EQ(test, ap.args.nodeid, id);
+	KUNIT_EXPECT_TRUE(test, ap.args.end == dc_test_end);
+	KUNIT_EXPECT_FALSE(test, ap.args.force);
+	KUNIT_EXPECT_EQ(test, ap.args.out_args[0].size, 4);
+	memcpy_from_folio(buffer, folio, 0, sizeof(buffer));
+	KUNIT_EXPECT_MEMEQ(test, buffer, "seed\0\0\0\0", sizeof(buffer));
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_READ], 1);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_RELEASE], 0);
+	folio_put(folio);
+}
+
+static void dc_lookup_only_entries_survive_cached_readdir(struct kunit *test)
+{
+	struct dc_test_state *s = test->priv;
+	struct dc_node *root = dc_node(s->fc.defer, FUSE_ROOT_ID);
+	u64 id;
+
+	FUSE_ARGS(a);
+
+	KUNIT_ASSERT_EQ(test, dc_load_dir(s->fc.defer, root, &a), 0);
+	KUNIT_ASSERT_TRUE(test, root->dir_loaded);
+	id = dc_test_lookup(test, "virtual");
+	KUNIT_ASSERT_NE(test, id, 0);
+	KUNIT_EXPECT_EQ(test, dc_test_lookup(test, "virtual"), id);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_LOOKUP], 1);
+}
+
+static void dc_server_owned_mutations_are_rejected(struct kunit *test)
+{
+	struct dc_test_state *s = test->priv;
+	u64 id = dc_test_lookup(test, "virtual");
+	struct fuse_open_in in = { .flags = O_RDWR };
+	struct fuse_link_in link = { .oldnodeid = id };
+	struct fuse_rename_in rename = { .newdir = FUSE_ROOT_ID };
+
+	FUSE_ARGS(a);
+
+	KUNIT_ASSERT_NE(test, id, 0);
+	a.nodeid = id;
+	a.opcode = FUSE_OPEN;
+	a.in_numargs = 1;
+	a.in_args[0] = (struct fuse_in_arg){ sizeof(in), &in };
+	KUNIT_EXPECT_EQ(test, fuse_defer_request(&s->fc, &a), -EACCES);
+	a.opcode = FUSE_SETATTR;
+	KUNIT_EXPECT_EQ(test, fuse_defer_request(&s->fc, &a), -EPERM);
+	a.opcode = FUSE_SETXATTR;
+	KUNIT_EXPECT_EQ(test, fuse_defer_request(&s->fc, &a), -EPERM);
+	a.nodeid = FUSE_ROOT_ID;
+	a.opcode = FUSE_UNLINK;
+	a.in_numargs = 2;
+	fuse_set_zero_arg0(&a);
+	a.in_args[1] = (struct fuse_in_arg){ sizeof("virtual"), "virtual" };
+	KUNIT_EXPECT_EQ(test, fuse_defer_request(&s->fc, &a), -EPERM);
+	a.opcode = FUSE_LINK;
+	a.in_args[0] = (struct fuse_in_arg){ sizeof(link), &link };
+	a.in_args[1] = (struct fuse_in_arg){ sizeof("alias"), "alias" };
+	KUNIT_EXPECT_EQ(test, fuse_defer_request(&s->fc, &a), -EPERM);
+	a.opcode = FUSE_RENAME;
+	a.in_numargs = 3;
+	a.in_args[0] = (struct fuse_in_arg){ sizeof(rename), &rename };
+	a.in_args[1] = (struct fuse_in_arg){ sizeof("virtual"), "virtual" };
+	a.in_args[2] = (struct fuse_in_arg){ sizeof("renamed"), "renamed" };
+	KUNIT_EXPECT_EQ(test, fuse_defer_request(&s->fc, &a), -EPERM);
+	KUNIT_EXPECT_TRUE(test, list_empty(&s->fc.defer->journal));
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_OPEN], 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_SETATTR], 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_SETXATTR], 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_UNLINK], 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_LINK], 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_RENAME], 0);
+}
+
 static void dc_cached_xattrs(struct kunit *test)
 {
 	struct dc_test_state *s = test->priv;
@@ -526,6 +737,10 @@ static struct kunit_case dc_tests[] = {
 	KUNIT_CASE(dc_cached_attributes),
 	KUNIT_CASE(dc_lookup_uses_counted_names),
 	KUNIT_CASE(dc_symlink_uses_zero_header_layout),
+	KUNIT_CASE(dc_server_owned_open_lifecycle),
+	KUNIT_CASE(dc_server_owned_page_reads),
+	KUNIT_CASE(dc_lookup_only_entries_survive_cached_readdir),
+	KUNIT_CASE(dc_server_owned_mutations_are_rejected),
 	KUNIT_CASE(dc_cached_xattrs),
 	KUNIT_CASE(dc_deferred_mutations),
 	KUNIT_CASE(dc_failed_replay_is_retryable),

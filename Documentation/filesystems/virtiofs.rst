@@ -115,6 +115,17 @@ lookups are authoritative until unmount. Local mutations update these cached
 results without revalidating them on the host. Cached directory contents and
 symlink targets are also retained. Cold reads can still require host requests.
 
+Synthetic read-only entries, such as libkrun's ``FsOverlay``/``AugmentFs`` files
+``/init.krun`` and ``/.krun_config.json``, remain server-owned. When the feature
+is negotiated, the device marks their lookup replies with the experimental
+``FUSE_ATTR_SERVER_OWNED`` attribute flag (bit 31). Their reads use the handle
+from the guest's actual open, and release reaches the server only when the
+guest releases the file. Mutations of these entries are rejected, not journaled.
+Zero-timeout server-owned names retain their one-shot lookup semantics; ordinary
+host files retain aggressive positive, negative, attribute and xattr caching.
+Directory listings need not enumerate synthetic entries, so the first lookup
+of an unknown name still queries the server even after readdir is cached.
+
 File data uses the guest page cache. Background writeback and close move dirty
 data into the guest journal, not to the host. The journal also records create,
 mkdir, mknod, symlink, link, unlink, rmdir, rename, setattr, setxattr and

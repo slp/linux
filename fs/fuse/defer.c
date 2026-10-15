@@ -28,6 +28,7 @@ struct dc_node {
 	u64 id, host, host_size, parent;
 	struct fuse_attr attr;
 	bool attr_valid, dir_loaded, xattrs_loaded, dirty;
+	bool server_owned, volatile_name;
 	u64 cookie;
 	struct list_head children, xattrs;
 	char *symlink;
@@ -208,6 +209,10 @@ static void dc_entry_out(struct dc_node *n, struct fuse_entry_out *out)
 		out->nodeid = n->id;
 		out->generation = 1;
 		out->attr = n->attr;
+		if (n->volatile_name) {
+			out->entry_valid = 0;
+			out->attr_valid = 0;
+		}
 	}
 }
 
@@ -257,7 +262,7 @@ static int dc_lookup(struct fuse_defer *dc, struct dc_node *dir,
 	if (!e)
 		return dc->alloc_error;
 	*entry = e;
-	if (e->node || (!e->present && dir->dir_loaded))
+	if (e->node && !e->node->volatile_name)
 		return 0;
 	/* A negative entry has type UINT_MAX, unlike an unqueried directory name. */
 	if (e->type == UINT_MAX)
@@ -273,6 +278,7 @@ static int dc_lookup(struct fuse_defer *dc, struct dc_node *dir,
 	a.out_args[0] = (struct fuse_arg){ sizeof(out), &out };
 	err = dc_send(dc, &a);
 	if (err == -ENOENT || (!err && !out.nodeid)) {
+		e->node = NULL;
 		e->present = false;
 		e->type = UINT_MAX;
 		return 0;
@@ -284,6 +290,9 @@ static int dc_lookup(struct fuse_defer *dc, struct dc_node *dir,
 		return dc->alloc_error;
 	if (!n->attr_valid) {
 		n->attr = out.attr;
+		n->server_owned = out.attr.flags & FUSE_ATTR_SERVER_OWNED;
+		n->volatile_name = n->server_owned && !out.entry_valid && !out.entry_valid_nsec;
+		n->attr.flags &= ~FUSE_ATTR_SERVER_OWNED;
 		n->host_size = out.attr.size;
 		n->attr_valid = true;
 		n->parent = dir->id;
@@ -994,6 +1003,8 @@ static int dc_unlink(struct fuse_defer *dc, struct dc_node *dir,
 	if (!e->present)
 		return -ENOENT;
 	n = e->node;
+	if (n->server_owned)
+		return -EPERM;
 	if (a->opcode == FUSE_RMDIR) {
 		if (!S_ISDIR(n->attr.mode))
 			return -ENOTDIR;
@@ -1037,6 +1048,8 @@ static int dc_rename(struct fuse_defer *dc, struct dc_node *dir,
 
 	if (!newdir || flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE))
 		return -EOPNOTSUPP;
+	if (newdir->server_owned)
+		return -EPERM;
 	err = dc_lookup(dc, dir, a->in_args[1].value,
 			strlen(a->in_args[1].value), a, &old);
 	if (err)
@@ -1047,6 +1060,8 @@ static int dc_rename(struct fuse_defer *dc, struct dc_node *dir,
 			strlen(a->in_args[2].value), a, &new);
 	if (err)
 		return err;
+	if (old->node->server_owned || (new->present && new->node->server_owned))
+		return -EPERM;
 	if (old == new || (new->present && old->node == new->node))
 		return 0;
 	if (new->present && (flags & RENAME_NOREPLACE))
@@ -1121,6 +1136,8 @@ static int dc_link(struct fuse_defer *dc, struct dc_node *dir, struct fuse_args 
 
 	if (!n)
 		return -ESTALE;
+	if (n->server_owned)
+		return -EPERM;
 	err = dc_lookup(dc, dir, a->in_args[1].value,
 			strlen(a->in_args[1].value), a, &e);
 	if (err)
@@ -1284,6 +1301,70 @@ static int dc_commit(struct fuse_defer *dc, const struct fuse_args *src)
 	return atomic_read(&dc->write_error);
 }
 
+static ssize_t dc_server_request(struct fuse_defer *dc, struct dc_node *n,
+				struct fuse_args *a)
+{
+	void (*end)(struct fuse_args *, int) = a->end;
+	u64 nodeid = a->nodeid;
+	bool force = a->force;
+	ssize_t ret;
+
+	switch (a->opcode) {
+	case FUSE_OPEN: {
+		const struct fuse_open_in *in = a->in_args[0].value;
+
+		if ((in->flags & O_ACCMODE) != O_RDONLY || (in->flags & O_TRUNC))
+			return -EACCES;
+		fallthrough;
+	}
+	case FUSE_GETATTR:
+	case FUSE_OPENDIR:
+	case FUSE_READ:
+	case FUSE_READLINK:
+	case FUSE_READDIR:
+	case FUSE_GETXATTR:
+	case FUSE_LISTXATTR:
+	case FUSE_FLUSH:
+	case FUSE_RELEASE:
+	case FUSE_RELEASEDIR:
+		/*
+		 * Keep the original request's embedded page descriptors, but leave
+		 * completion to the outer worker. Only the guest RELEASE may retire
+		 * a one-shot inode, not an internal read's temporary close.
+		 */
+		a->nodeid = n->host;
+		a->end = NULL;
+		ret = dc_send(dc, a);
+		a->nodeid = nodeid;
+		a->end = end;
+		a->force = force;
+		return ret;
+	case FUSE_CREATE:
+	case FUSE_MKNOD:
+	case FUSE_MKDIR:
+	case FUSE_SYMLINK:
+	case FUSE_UNLINK:
+	case FUSE_RMDIR:
+	case FUSE_RENAME:
+	case FUSE_RENAME2:
+	case FUSE_LINK:
+	case FUSE_SETATTR:
+	case FUSE_WRITE:
+	case FUSE_SETXATTR:
+	case FUSE_REMOVEXATTR:
+	case FUSE_FALLOCATE:
+		return -EPERM;
+	case FUSE_STATX:
+	case FUSE_TMPFILE:
+	case FUSE_GETLK:
+	case FUSE_SETLK:
+	case FUSE_SETLKW:
+		return -ENOSYS;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
 static ssize_t dc_request(struct fuse_defer *dc, struct fuse_args *a)
 {
 	struct dc_node *n = dc_node(dc, a->nodeid ?: FUSE_ROOT_ID);
@@ -1297,6 +1378,9 @@ static ssize_t dc_request(struct fuse_defer *dc, struct fuse_args *a)
 			return err;
 		return dc_send(dc, a);
 	}
+	if (n && n->server_owned && a->opcode != FUSE_LOOKUP &&
+	    a->opcode != FUSE_IOCTL && a->opcode != FUSE_STATFS)
+		return dc_server_request(dc, n, a);
 	if (a->opcode == FUSE_FLUSH || a->opcode == FUSE_RELEASE ||
 	    a->opcode == FUSE_RELEASEDIR)
 		return 0;
