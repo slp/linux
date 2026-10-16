@@ -28,13 +28,13 @@ struct dc_node {
 	struct list_head list;
 	struct hlist_node host_hash;
 	u64 id, host, host_size, parent;
-	u64 read_fh, open_count;
-	u64 dirty_seq;
+	u64 read_fh, open_count, read_count;
+	u64 dirty_seq, data_seq;
 	struct fuse_attr attr;
 	bool attr_valid, dir_loaded, xattrs_loaded, dirty;
 	bool server_owned, volatile_name, read_open;
 	u64 cookie;
-	struct list_head children, xattrs;
+	struct list_head children, xattrs, data_ops;
 	char *symlink;
 };
 
@@ -57,7 +57,7 @@ struct dc_xattr {
 };
 
 struct dc_op {
-	struct list_head list;
+	struct list_head list, data_list;
 	struct fuse_args args;
 	struct dc_node *node, *result, *other;
 	u64 seq;
@@ -70,7 +70,7 @@ struct fuse_defer {
 	struct mutex replay_lock, admission_lock;
 	struct workqueue_struct *writeback_wq;
 	struct work_struct writeback_work;
-	wait_queue_head_t space_wait;
+	wait_queue_head_t space_wait, read_wait;
 	struct fuse_conn *fc;
 	struct list_head nodes, journal;
 	DECLARE_HASHTABLE(names, DC_HASH_BITS);
@@ -82,6 +82,7 @@ struct fuse_defer {
 	size_t journal_bytes, blocked_bytes;
 	int alloc_error;
 	int writeback_error;
+	unsigned int active_reads;
 	atomic_t pending;
 	atomic_t write_error;
 	bool initialized, stopping;
@@ -152,6 +153,7 @@ static struct dc_node *dc_new_node(struct fuse_defer *dc, u64 host)
 	n->cookie = 2;
 	INIT_LIST_HEAD(&n->children);
 	INIT_LIST_HEAD(&n->xattrs);
+	INIT_LIST_HEAD(&n->data_ops);
 	err = xa_err(xa_store(&dc->ids, n->id, n, GFP_NOFS));
 	if (err) {
 		dc_free(dc, n);
@@ -369,7 +371,7 @@ static void dc_close_host(struct fuse_defer *dc, struct dc_node *n,
 static void dc_close_read(struct fuse_defer *dc, struct dc_node *n,
 			  const struct fuse_args *src)
 {
-	if (!n->read_open)
+	if (!n->read_open || n->read_count)
 		return;
 	dc_close_host(dc, n, src, n->read_fh, O_RDONLY, false);
 	n->read_open = false;
@@ -418,6 +420,7 @@ static struct dc_op *dc_save(struct fuse_defer *dc, struct fuse_args *a,
 	op->args.end = NULL;
 	op->args.out_argvar = false;
 	op->node = n;
+	INIT_LIST_HEAD(&op->data_list);
 	op->bytes = sizeof(struct dc_allocation) + size;
 	p = op->data;
 	for (i = 0; i < a->in_numargs; i++) {
@@ -456,6 +459,12 @@ static void dc_append(struct fuse_defer *dc, struct dc_op *op)
 {
 	op->seq = ++dc->next_seq;
 	list_add_tail(&op->list, &dc->journal);
+	if (op->args.opcode == FUSE_WRITE ||
+	    (op->args.opcode == FUSE_SETATTR &&
+	     (((const struct fuse_setattr_in *)op->args.in_args[0].value)->valid & FATTR_SIZE))) {
+		list_add_tail(&op->data_list, &op->node->data_ops);
+		op->node->data_seq = op->seq;
+	}
 	dc->journal_bytes += op->bytes;
 	dc_dirty(op->node, op->seq);
 	dc_dirty(op->result, op->seq);
@@ -906,6 +915,58 @@ static ssize_t dc_xattr(struct fuse_defer *dc, struct dc_node *n,
 	return err;
 }
 
+static ssize_t dc_read_host(struct fuse_defer *dc, struct dc_node *n,
+			    const struct fuse_args *src, struct fuse_read_in in,
+			    void *buffer, size_t size, bool unlocked)
+{
+	u64 fh;
+	bool cached;
+	ssize_t err;
+
+	FUSE_ARGS(raw);
+
+	lockdep_assert_held(&dc->lock);
+	if (n->read_open) {
+		fh = n->read_fh;
+	} else {
+		err = dc_open_host(dc, n, src, O_RDONLY, &fh, false);
+		if (err)
+			return err;
+		if (n->open_count) {
+			n->read_fh = fh;
+			n->read_open = true;
+		}
+	}
+	cached = n->read_open;
+	in.fh = fh;
+	in.size = min_t(u64, size, n->host_size - in.offset);
+	dc_args(&raw, src, n, FUSE_READ);
+	raw.in_numargs = 1;
+	raw.in_args[0] = (struct fuse_in_arg){ sizeof(in), &in };
+	raw.out_numargs = 1;
+	raw.out_args[0] = (struct fuse_arg){ in.size, buffer };
+	raw.out_argvar = true;
+	if (unlocked) {
+		dc->active_reads++;
+		if (cached)
+			n->read_count++;
+		mutex_unlock(&dc->lock);
+	}
+	err = dc_send(dc, &raw);
+	if (unlocked) {
+		mutex_lock(&dc->lock);
+		if (!--dc->active_reads)
+			wake_up_all(&dc->read_wait);
+		if (cached)
+			n->read_count--;
+	}
+	if (!cached)
+		dc_close_host(dc, n, src, fh, O_RDONLY, false);
+	else if (!n->open_count)
+		dc_close_read(dc, n, src);
+	return err;
+}
+
 static ssize_t dc_read(struct fuse_defer *dc, struct dc_node *n,
 		       struct fuse_args *a)
 {
@@ -913,8 +974,10 @@ static ssize_t dc_read(struct fuse_defer *dc, struct dc_node *n,
 	struct dc_op *op;
 	char *buffer;
 	size_t size;
-	ssize_t err = 0;
+	bool retry = false;
+	ssize_t err;
 
+again:
 	if (in.offset >= n->attr.size)
 		return dc_output(a, NULL, 0);
 	size = min_t(u64, in.size, n->attr.size - in.offset);
@@ -922,37 +985,20 @@ static ssize_t dc_read(struct fuse_defer *dc, struct dc_node *n,
 	if (!buffer)
 		return -ENOMEM;
 	if (n->host && in.offset < n->host_size) {
-		FUSE_ARGS(raw);
-		u64 fh;
+		bool unlocked = !retry && list_empty(&n->data_ops);
+		u64 seq = n->data_seq;
 
-		if (n->read_open) {
-			fh = n->read_fh;
-		} else {
-			err = dc_open_host(dc, n, a, O_RDONLY, &fh, false);
-			if (err)
-				goto out;
-			if (n->open_count) {
-				n->read_fh = fh;
-				n->read_open = true;
-			}
+		err = dc_read_host(dc, n, a, in, buffer, size, unlocked);
+		if (unlocked && seq != n->data_seq) {
+			/* Replay may have retired a concurrent write's overlay already. */
+			kvfree(buffer);
+			retry = true;
+			goto again;
 		}
-		in.fh = fh;
-		in.size = min_t(u64, size, n->host_size - in.offset);
-		dc_args(&raw, a, n, FUSE_READ);
-		raw.in_numargs = 1;
-		raw.in_args[0] = (struct fuse_in_arg){ sizeof(in), &in };
-		raw.out_numargs = 1;
-		raw.out_args[0] = (struct fuse_arg){ in.size, buffer };
-		raw.out_argvar = true;
-		err = dc_send(dc, &raw);
-		if (!n->read_open)
-			dc_close_host(dc, n, a, fh, O_RDONLY, false);
 		if (err < 0)
 			goto out;
 	}
-	list_for_each_entry(op, &dc->journal, list) {
-		if (op->node != n)
-			continue;
+	list_for_each_entry(op, &n->data_ops, data_list) {
 		if (op->args.opcode == FUSE_WRITE) {
 			const struct fuse_write_in *wr = op->args.in_args[0].value;
 			u64 start = max(in.offset, wr->offset);
@@ -1341,6 +1387,7 @@ static int dc_replay_one(struct fuse_defer *dc)
 		dc->writeback_error = err;
 	} else {
 		list_del(&op->list);
+		list_del(&op->data_list);
 		dc->journal_bytes -= op->bytes;
 		dc_free(dc, op);
 	}
@@ -1505,6 +1552,11 @@ static ssize_t dc_request(struct fuse_defer *dc, struct fuse_args *a)
 		err = dc_commit(dc, a);
 		if (err || a->opcode != FUSE_DESTROY)
 			return err;
+		while (dc->active_reads) {
+			mutex_unlock(&dc->lock);
+			wait_event(dc->read_wait, !READ_ONCE(dc->active_reads));
+			mutex_lock(&dc->lock);
+		}
 		list_for_each_entry(n, &dc->nodes, list)
 			dc_close_read(dc, n, a);
 		return dc_send(dc, a);
@@ -1829,6 +1881,7 @@ int fuse_defer_init(struct fuse_conn *fc)
 	mutex_init(&dc->replay_lock);
 	mutex_init(&dc->admission_lock);
 	init_waitqueue_head(&dc->space_wait);
+	init_waitqueue_head(&dc->read_wait);
 	INIT_WORK(&dc->writeback_work, dc_writeback_work);
 	dc->writeback_wq = alloc_workqueue("fuse-defer-writeback",
 					 WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
@@ -1876,8 +1929,10 @@ void fuse_defer_destroy(struct fuse_conn *fc)
 	mutex_unlock(&dc->lock);
 	cancel_work_sync(&dc->writeback_work);
 	destroy_workqueue(dc->writeback_wq);
-	list_for_each_entry_safe(op, next_op, &dc->journal, list)
+	list_for_each_entry_safe(op, next_op, &dc->journal, list) {
+		list_del(&op->data_list);
 		dc_free(dc, op);
+	}
 	list_for_each_entry_safe(n, next, &dc->nodes, list) {
 		struct dc_entry *e, *next_e;
 		struct dc_xattr *x, *next_x;

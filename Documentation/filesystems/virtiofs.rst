@@ -119,6 +119,12 @@ Ordinary files lazily acquire a host read handle on the first cold read and
 reuse it until the last guest open is released. Reading an uncached input
 archive therefore still produces host reads, without reopening and closing the
 host file for each read. Open and close alone do not checkpoint mutations.
+Pending writes and truncates are indexed per inode, so reading an unchanged
+archive does not scan the journal entries for extracted files. Clean reads
+release the shared cache mutex during host read I/O. If that inode's contents
+change concurrently, the read retries with serialization and the updated local
+view. Active reads keep their host handle alive until completion even if the
+last guest open is released meanwhile.
 
 Synthetic read-only entries, such as libkrun's ``FsOverlay``/``AugmentFs`` files
 ``/init.krun`` and ``/.krun_config.json``, remain server-owned. When the feature
@@ -192,8 +198,8 @@ or virtio-fs behavior when the feature is not negotiated.
 ``fs/fuse/defer.config`` provides a Kconfig fragment for these tests. They verify
 that repeated getattr and getxattr requests, including absent xattrs, do not
 reach the backend, and cover pressure writeback, writer admission, read-side
-progress during blocked host I/O, retryable failures, concurrent checkpoints
-and synthetic overlay files.
+progress during blocked host I/O, concurrent clean reads and mutations, retryable
+failures, concurrent checkpoints and synthetic overlay files.
 
 Without ``VIRTIO_FS_F_SYNC``, the driver does not read ``num_sync_queues`` or
 initialize synchronous queues, and retains the original queue routing and
