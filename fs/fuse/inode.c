@@ -1011,6 +1011,7 @@ void fuse_conn_put(struct fuse_conn *fc)
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
 		fuse_dax_conn_free(fc);
 	cancel_work_sync(&fc->epoch_work);
+	fuse_defer_destroy(fc);
 	fuse_chan_release(fc->chan);
 	put_pid_ns(fc->pid_ns);
 	bucket = rcu_dereference_protected(fc->curr_bucket, 1);
@@ -1020,7 +1021,6 @@ void fuse_conn_put(struct fuse_conn *fc)
 	}
 	if (IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
 		fuse_backing_files_free(fc);
-	fuse_defer_destroy(fc);
 	call_rcu(&fc->rcu, delayed_release);
 }
 EXPORT_SYMBOL_GPL(fuse_conn_put);

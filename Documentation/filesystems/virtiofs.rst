@@ -101,8 +101,9 @@ the FUSE request header retains its original layout and padding.
 Deferred guest writeback (experimental)
 ---------------------------------------
 
-``VIRTIO_FS_F_DEFERRED_WRITEBACK`` (experimental bit 2) permits a guest to keep
-filesystem mutations entirely in guest memory until an explicit checkpoint.
+``VIRTIO_FS_F_DEFERRED_WRITEBACK`` (experimental bit 2) permits a guest to buffer
+filesystem mutations locally, replay them under journal pressure, and establish
+durability at explicit checkpoints.
 It is independent of ``VIRTIO_FS_F_SYNC``. Both the device and the driver must
 negotiate it; devices must not offer it by default. The libkrun filesystem API
 offers it through ``FsDevice::set_deferred_writeback(true)`` or the equivalent
@@ -127,7 +128,7 @@ Directory listings need not enumerate synthetic entries, so the first lookup
 of an unknown name still queries the server even after readdir is cached.
 
 File data uses the guest page cache. Background writeback and close move dirty
-data into the guest journal, not to the host. The journal also records create,
+data into the guest journal. The journal also records create,
 mkdir, mknod, symlink, link, unlink, rmdir, rename, setattr, setxattr and
 removexattr operations. Files created locally have stable guest inode IDs, which
 are mapped to host node IDs when their creation is replayed. Unknown operations
@@ -141,21 +142,44 @@ the filesystem; normal shutdown subsequently issues ``sync()``.
 ``fsync()`` and directory ``fsync()`` checkpoint the whole mount, including the
 page cache of other files. ``sync()``, ``syncfs()`` and clean unmount also
 checkpoint. The journal is replayed in order, followed by host fsyncs of affected
-files and directories. A completed journal operation is not replayed again if a
-later operation fails. Dirty durability state is retained after host fsync
-failure so a subsequent checkpoint can retry. A checkpoint is not an atomic
+files and directories. Each checkpoint covers the journal sequence captured at
+its start; concurrent later mutations remain dirty for the next checkpoint.
+A completed journal operation is not replayed again if a later operation fails.
+Dirty durability state is retained after host fsync failure so a subsequent
+checkpoint can retry. A checkpoint is not an atomic
 transaction: host-visible changes may be partially applied on error or crash.
 
-The ``fuse.deferred_cache_mb`` parameter sets the per-mount cache and journal
-budget, in MiB (default 256). Namespace/inode and xattr records are pinned for
-the mount lifetime in this initial implementation; successful commits free the
-journal, but not these records. Cache exhaustion returns ``ENOSPC`` and memory
-allocation failures return ``ENOMEM``; neither triggers an implicit commit.
+The ``fuse.deferred_cache_mb`` parameter sets the per-mount pending-journal
+budget, in MiB (default 256). At 75% usage, a dedicated reclaim-capable worker
+starts replaying ordered batches, aiming to reduce usage to 50%. This pressure
+writeback does not issue host fsyncs or clear dirty durability state. Changes
+can therefore become host-visible before an explicit checkpoint, but durability
+is guaranteed only by a successful checkpoint.
+
+When an incoming mutation would exceed the budget, its caller waits for journal
+space rather than receiving a cache-generated ``ENOSPC``. Read-only requests
+do not wait for journal admission, and replay releases the cache mutex during
+host I/O. A single request larger than the budget is admitted only after the
+existing journal has drained, so small budgets do not reject valid requests.
+
+Namespace/inode, symlink and xattr records remain pinned for the mount lifetime
+in this initial implementation. They are accounted separately from the journal,
+so journal exhaustion cannot prevent cold lookups or xattr reads. The journal
+budget is not a total memory limit: pinned metadata, guest page-cache data and
+in-flight requests require additional guest memory. Real memory allocation
+failures can still return ``ENOMEM``.
+
+On a host replay error, background draining stops, retains the failed operation
+and wakes blocked writers with that error. Reads can still use cached state;
+an explicit checkpoint retries the retained journal. Genuine host ``ENOSPC``
+errors are not hidden.
 If buffered data could not be retained, subsequent checkpoints continue to
 report the write error rather than claim that the data was made durable.
 
-Uncommitted changes are lost on guest crash or forced teardown. Clean-unmount
-commit failures are logged, but teardown cannot preserve an in-memory journal.
+Changes retained only in guest memory are lost on guest crash or forced teardown.
+Pressure-replayed changes are not guaranteed durable before a checkpoint.
+Clean-unmount commit failures are logged, but teardown cannot preserve an
+in-memory journal.
 DAX, read-only exports, NullFs exports and context-dependent permission
 semantics are incompatible with this mode. There is no change to normal FUSE
 or virtio-fs behavior when the feature is not negotiated.
@@ -163,7 +187,9 @@ or virtio-fs behavior when the feature is not negotiated.
 ``CONFIG_FUSE_DEFER_KUNIT_TEST`` builds request-level cache and replay tests.
 ``fs/fuse/defer.config`` provides a Kconfig fragment for these tests. They verify
 that repeated getattr and getxattr requests, including absent xattrs, do not
-reach the backend, and cover deferred writes, commit retries and cache limits.
+reach the backend, and cover pressure writeback, writer admission, read-side
+progress during blocked host I/O, retryable failures, concurrent checkpoints
+and synthetic overlay files.
 
 Without ``VIRTIO_FS_F_SYNC``, the driver does not read ``num_sync_queues`` or
 initialize synchronous queues, and retains the original queue routing and

@@ -1,16 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <kunit/test.h>
+#include <linux/completion.h>
+#include <linux/kthread.h>
 
 struct dc_test_state {
 	struct fuse_conn fc;
 	u32 calls[64];
 	u32 fail;
+	int fail_error;
 	u64 next_host;
 	char disk[128];
 	size_t disk_size;
 	char symlink_name[32];
 	char symlink_target[128];
 	bool server_looked_up, server_open, server_released;
+	u32 block_opcode;
+	struct completion io_entered, io_release, request_done;
+	struct task_struct *request_task;
+	struct kunit *test;
+	u64 request_id;
+	u32 request_opcode;
+	int request_result;
 };
 
 static struct fuse_attr dc_test_attr(u64 id)
@@ -28,8 +38,13 @@ static ssize_t dc_test_send(struct fuse_chan *chan, struct fuse_args *a)
 	if (a->opcode >= ARRAY_SIZE(s->calls))
 		return -ENOSYS;
 	s->calls[a->opcode]++;
-	if (s->fail == a->opcode)
-		return -EIO;
+	if (READ_ONCE(s->block_opcode) == a->opcode) {
+		complete(&s->io_entered);
+		if (!wait_for_completion_timeout(&s->io_release, 5 * HZ))
+			return -ETIMEDOUT;
+	}
+	if (READ_ONCE(s->fail) == a->opcode)
+		return s->fail_error ?: -EIO;
 	switch (a->opcode) {
 	case FUSE_GETATTR: {
 		struct fuse_attr_out *out = a->out_args[0].value;
@@ -60,6 +75,10 @@ static ssize_t dc_test_send(struct fuse_chan *chan, struct fuse_args *a)
 			};
 			out->attr.size = s->disk_size;
 			out->attr.flags = FUSE_ATTR_SERVER_OWNED;
+			return 0;
+		}
+		if (a->in_args[1].size == 7 && !memcmp(a->in_args[1].value, "command", 7)) {
+			*out = (struct fuse_entry_out){ .nodeid = 300, .attr = dc_test_attr(300) };
 			return 0;
 		}
 		if (a->in_args[1].size != 4 || memcmp(a->in_args[1].value, "base", 4))
@@ -177,6 +196,10 @@ static int dc_test_init(struct kunit *test)
 	if (!s)
 		return -ENOMEM;
 	test->priv = s;
+	s->test = test;
+	init_completion(&s->io_entered);
+	init_completion(&s->io_release);
+	init_completion(&s->request_done);
 	s->next_host = 100;
 	memcpy(s->disk, "seed", 4);
 	s->disk_size = 4;
@@ -193,6 +216,9 @@ static void dc_test_exit(struct kunit *test)
 {
 	struct dc_test_state *s = test->priv;
 
+	complete_all(&s->io_release);
+	if (s->request_task)
+		kthread_stop(s->request_task);
 	fuse_defer_destroy(&s->fc);
 }
 
@@ -226,7 +252,7 @@ static u64 dc_test_create(struct kunit *test, const char *name)
 {
 	struct dc_test_state *s = test->priv;
 	struct fuse_create_in in = { .flags = O_RDWR, .mode = S_IFREG | 0644 };
-	struct fuse_entry_out out;
+	struct fuse_entry_out out = {};
 	struct fuse_open_out open;
 
 	FUSE_ARGS(a);
@@ -618,16 +644,212 @@ static void dc_failed_replay_is_retryable(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, s->calls[FUSE_CREATE], 1);
 }
 
-static void dc_cache_limit_never_flushes(struct kunit *test)
+static size_t dc_test_write_bytes(size_t size)
+{
+	FUSE_ARGS(a);
+
+	a.opcode = FUSE_WRITE;
+	a.in_numargs = 2;
+	a.in_args[0].size = sizeof(struct fuse_write_in);
+	a.in_args[1].size = size;
+	return dc_request_bytes(&a);
+}
+
+static int dc_test_request_thread(void *data)
+{
+	struct dc_test_state *s = data;
+
+	if (s->request_opcode == FUSE_WRITE)
+		s->request_result = dc_test_write(s->test, s->request_id, 0, "next");
+	else
+		s->request_result = dc_test_commit(s->test, s->request_opcode);
+	complete(&s->request_done);
+	set_current_state(TASK_INTERRUPTIBLE);
+	while (!kthread_should_stop()) {
+		schedule();
+		set_current_state(TASK_INTERRUPTIBLE);
+	}
+	__set_current_state(TASK_RUNNING);
+	return 0;
+}
+
+static void dc_pressure_writeback_skips_fsync(struct kunit *test)
 {
 	struct dc_test_state *s = test->priv;
-	u64 id = dc_test_create(test, "new");
+	struct fuse_defer *dc = s->fc.defer;
+	u64 id = dc_test_lookup(test, "base");
+	char buffer[8];
+	unsigned int i;
 
-	s->fc.defer->limit = s->fc.defer->used;
-	KUNIT_EXPECT_EQ(test, dc_test_write(test, id, 0, "no room"), -ENOSPC);
-	KUNIT_EXPECT_EQ(test, s->calls[FUSE_CREATE], 0);
-	KUNIT_EXPECT_EQ(test, s->calls[FUSE_WRITE], 0);
+	dc->limit = 4 * dc_test_write_bytes(4);
+	for (i = 0; i < 1000; i++) {
+		KUNIT_ASSERT_EQ(test, dc_test_write(test, id, 0, "data"), 0);
+		KUNIT_EXPECT_LE(test, READ_ONCE(dc->journal_bytes), dc->limit);
+	}
+	flush_workqueue(dc->writeback_wq);
+	KUNIT_EXPECT_LE(test, dc->journal_bytes, dc->limit / 2);
+	KUNIT_EXPECT_GT(test, s->calls[FUSE_WRITE], 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_FSYNC], 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_FSYNCDIR], 0);
+	KUNIT_EXPECT_TRUE(test, dc_node(dc, id)->dirty);
+	KUNIT_EXPECT_EQ(test, dc_test_read(test, id, buffer, sizeof(buffer)), 4);
+	KUNIT_EXPECT_MEMEQ(test, buffer, "data", 4);
+	KUNIT_EXPECT_EQ(test, dc_test_commit(test, FUSE_SYNCFS), 0);
+	KUNIT_EXPECT_EQ(test, dc->journal_bytes, 0);
+	KUNIT_EXPECT_FALSE(test, dc_node(dc, id)->dirty);
+	KUNIT_EXPECT_EQ(test, atomic_read(&dc->write_error), 0);
+	KUNIT_EXPECT_GT(test, s->calls[FUSE_FSYNC], 0);
+}
+
+static void dc_pressure_preserves_read_side_progress(struct kunit *test)
+{
+	struct dc_test_state *s = test->priv;
+	struct fuse_defer *dc = s->fc.defer;
+	u64 id = dc_test_lookup(test, "base");
+	struct fuse_getxattr_in in = { .size = 4 };
+	char buffer[8];
+	struct task_struct *task;
+
+	FUSE_ARGS(a);
+
+	dc->limit = dc_test_write_bytes(4);
+	s->block_opcode = FUSE_WRITE;
+	KUNIT_ASSERT_EQ(test, dc_test_write(test, id, 0, "data"), 0);
+	KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&s->io_entered, 5 * HZ), 0);
+	s->request_id = id;
+	s->request_opcode = FUSE_WRITE;
+	task = kthread_run(dc_test_request_thread, s, "fuse-defer-test");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(task));
+	s->request_task = task;
+	KUNIT_EXPECT_EQ(test, wait_for_completion_timeout(&s->request_done, HZ / 20), 0);
+	KUNIT_EXPECT_EQ(test, dc_test_lookup(test, "uncached-command"), 0);
+	KUNIT_EXPECT_NE(test, dc_test_lookup(test, "command"), 0);
+	KUNIT_EXPECT_EQ(test, dc_test_read(test, id, buffer, sizeof(buffer)), 4);
+	KUNIT_EXPECT_MEMEQ(test, buffer, "data", 4);
+	a.opcode = FUSE_GETXATTR;
+	a.nodeid = id;
+	a.in_numargs = 2;
+	a.in_args[0] = (struct fuse_in_arg){ sizeof(in), &in };
+	a.in_args[1] = (struct fuse_in_arg){ sizeof("user.present"), "user.present" };
+	a.out_numargs = 1;
+	a.out_args[0] = (struct fuse_arg){ sizeof(buffer), buffer };
+	a.out_argvar = true;
+	KUNIT_EXPECT_EQ(test, fuse_defer_request(&s->fc, &a), 4);
+	KUNIT_EXPECT_MEMEQ(test, buffer, "seed", 4);
+	KUNIT_EXPECT_GT(test, READ_ONCE(dc->used), dc->limit);
+	complete_all(&s->io_release);
+	KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&s->request_done, 5 * HZ), 0);
+	KUNIT_EXPECT_EQ(test, s->request_result, 0);
+	KUNIT_EXPECT_EQ(test, dc_test_commit(test, FUSE_SYNCFS), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&dc->write_error), 0);
+	KUNIT_EXPECT_EQ(test, fuse_defer_request(&s->fc, &a), 4);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_GETXATTR], 2);
+}
+
+static void dc_namespace_growth_does_not_exhaust_journal(struct kunit *test)
+{
+	struct dc_test_state *s = test->priv;
+	struct fuse_defer *dc = s->fc.defer;
+	u64 last = 0;
+	char name[32];
+	unsigned int i;
+
+	dc->limit = 1024;
+	s->next_host = 1000;
+	for (i = 0; i < 256; i++) {
+		snprintf(name, sizeof(name), "new-%u", i);
+		last = dc_test_create(test, name);
+		KUNIT_ASSERT_NE(test, last, 0);
+	}
+	KUNIT_EXPECT_GT(test, READ_ONCE(dc->used), dc->limit);
+	KUNIT_EXPECT_EQ(test, dc_test_commit(test, FUSE_SYNCFS), 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_CREATE], 256);
+	KUNIT_EXPECT_EQ(test, dc_test_lookup(test, "new-255"), last);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_LOOKUP], 256);
+	KUNIT_EXPECT_EQ(test, dc->journal_bytes, 0);
+}
+
+static void dc_single_oversized_request_is_admitted(struct kunit *test)
+{
+	struct dc_test_state *s = test->priv;
+	u64 id = dc_test_lookup(test, "base");
+
+	s->fc.defer->limit = 1;
+	KUNIT_ASSERT_EQ(test, dc_test_write(test, id, 0, "larger than the budget"), 0);
+	flush_workqueue(s->fc.defer->writeback_wq);
+	KUNIT_EXPECT_EQ(test, s->fc.defer->journal_bytes, 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_WRITE], 1);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_FSYNC], 0);
+	KUNIT_EXPECT_EQ(test, dc_test_commit(test, FUSE_SYNCFS), 0);
+}
+
+static void dc_pressure_failure_keeps_retryable_data(struct kunit *test)
+{
+	struct dc_test_state *s = test->priv;
+	struct fuse_defer *dc = s->fc.defer;
+	u64 id = dc_test_lookup(test, "base");
+	char buffer[8];
+
+	dc->limit = dc_test_write_bytes(5);
+	s->fail = FUSE_WRITE;
+	KUNIT_ASSERT_EQ(test, dc_test_write(test, id, 0, "local"), 0);
+	flush_workqueue(dc->writeback_wq);
+	KUNIT_EXPECT_EQ(test, dc->writeback_error, -EIO);
+	KUNIT_EXPECT_FALSE(test, list_empty(&dc->journal));
+	KUNIT_EXPECT_EQ(test, dc_test_read(test, id, buffer, sizeof(buffer)), 5);
+	KUNIT_EXPECT_MEMEQ(test, buffer, "local", 5);
+	KUNIT_EXPECT_EQ(test, dc_test_lookup(test, "another-command"), 0);
+	KUNIT_EXPECT_EQ(test, dc_test_commit(test, FUSE_SYNCFS), -EIO);
+	s->fail = 0;
+	KUNIT_EXPECT_EQ(test, dc_test_commit(test, FUSE_SYNCFS), 0);
+	KUNIT_EXPECT_EQ(test, dc->writeback_error, 0);
+	KUNIT_EXPECT_EQ(test, dc->journal_bytes, 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&dc->write_error), 0);
+}
+
+static void dc_pressure_reports_host_enospc(struct kunit *test)
+{
+	struct dc_test_state *s = test->priv;
+	u64 id = dc_test_lookup(test, "base");
+	char buffer[8];
+
+	s->fc.defer->limit = dc_test_write_bytes(4);
+	s->fail = FUSE_WRITE;
+	s->fail_error = -ENOSPC;
+	KUNIT_ASSERT_EQ(test, dc_test_write(test, id, 0, "data"), 0);
+	flush_workqueue(s->fc.defer->writeback_wq);
+	KUNIT_EXPECT_EQ(test, dc_test_write(test, id, 0, "next"), -ENOSPC);
+	KUNIT_EXPECT_NE(test, dc_test_lookup(test, "command"), 0);
+	KUNIT_EXPECT_EQ(test, dc_test_read(test, id, buffer, sizeof(buffer)), 4);
+	KUNIT_EXPECT_MEMEQ(test, buffer, "data", 4);
+	s->fail = 0;
 	KUNIT_EXPECT_EQ(test, dc_test_commit(test, FUSE_SYNCFS), -ENOSPC);
+	KUNIT_EXPECT_EQ(test, s->fc.defer->journal_bytes, 0);
+	KUNIT_EXPECT_MEMEQ(test, s->disk, "data", 4);
+}
+
+static void dc_checkpoint_keeps_concurrent_writes_dirty(struct kunit *test)
+{
+	struct dc_test_state *s = test->priv;
+	u64 id = dc_test_lookup(test, "base");
+	struct task_struct *task;
+
+	KUNIT_ASSERT_EQ(test, dc_test_write(test, id, 0, "data"), 0);
+	s->block_opcode = FUSE_FSYNC;
+	s->request_opcode = FUSE_SYNCFS;
+	task = kthread_run(dc_test_request_thread, s, "fuse-defer-sync-test");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(task));
+	s->request_task = task;
+	KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&s->io_entered, 5 * HZ), 0);
+	KUNIT_ASSERT_EQ(test, dc_test_write(test, id, 0, "next"), 0);
+	complete_all(&s->io_release);
+	KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&s->request_done, 5 * HZ), 0);
+	KUNIT_EXPECT_EQ(test, s->request_result, 0);
+	KUNIT_EXPECT_TRUE(test, dc_node(s->fc.defer, id)->dirty);
+	KUNIT_EXPECT_FALSE(test, list_empty(&s->fc.defer->journal));
+	KUNIT_EXPECT_EQ(test, dc_test_commit(test, FUSE_SYNCFS), 0);
+	KUNIT_EXPECT_FALSE(test, dc_node(s->fc.defer, id)->dirty);
+	KUNIT_EXPECT_MEMEQ(test, s->disk, "next", 4);
 }
 
 static void dc_xattr_mutations_stay_cached(struct kunit *test)
@@ -744,7 +966,13 @@ static struct kunit_case dc_tests[] = {
 	KUNIT_CASE(dc_cached_xattrs),
 	KUNIT_CASE(dc_deferred_mutations),
 	KUNIT_CASE(dc_failed_replay_is_retryable),
-	KUNIT_CASE(dc_cache_limit_never_flushes),
+	KUNIT_CASE(dc_pressure_writeback_skips_fsync),
+	KUNIT_CASE(dc_pressure_preserves_read_side_progress),
+	KUNIT_CASE(dc_namespace_growth_does_not_exhaust_journal),
+	KUNIT_CASE(dc_single_oversized_request_is_admitted),
+	KUNIT_CASE(dc_pressure_failure_keeps_retryable_data),
+	KUNIT_CASE(dc_pressure_reports_host_enospc),
+	KUNIT_CASE(dc_checkpoint_keeps_concurrent_writes_dirty),
 	KUNIT_CASE(dc_xattr_mutations_stay_cached),
 	KUNIT_CASE(dc_truncate_and_extend_preserve_zeroes),
 	KUNIT_CASE(dc_failed_fsync_keeps_durability_state),

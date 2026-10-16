@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Exclusive-owner guest cache. Raw channel sends are reserved for cache misses
- * and explicit commit; no background task is allowed to replay the journal.
+/* Exclusive-owner guest cache. Journal pressure may replay ordered mutations;
+ * explicit checkpoints additionally make the replayed changes durable.
  */
 #include "dev.h"
 #include "fuse_i.h"
@@ -10,6 +10,7 @@
 #include <linux/highmem.h>
 #include <linux/moduleparam.h>
 #include <linux/namei.h>
+#include <linux/sched/mm.h>
 #include <linux/slab.h>
 #include <linux/xattr.h>
 
@@ -17,15 +18,17 @@
 #define DC_TIMEOUT (365ULL * 24 * 60 * 60)
 #define DC_READ_SIZE (32 * 1024)
 #define DC_EXIT_CODE_IOCTL 0x7602
+#define DC_WRITEBACK_BATCH 32
 
 static unsigned long deferred_cache_mb = 256;
 module_param(deferred_cache_mb, ulong, 0444);
-MODULE_PARM_DESC(deferred_cache_mb, "Per-mount deferred cache limit in MiB");
+MODULE_PARM_DESC(deferred_cache_mb, "Per-mount deferred journal budget in MiB");
 
 struct dc_node {
 	struct list_head list;
 	struct hlist_node host_hash;
 	u64 id, host, host_size, parent;
+	u64 dirty_seq;
 	struct fuse_attr attr;
 	bool attr_valid, dir_loaded, xattrs_loaded, dirty;
 	bool server_owned, volatile_name;
@@ -56,22 +59,31 @@ struct dc_op {
 	struct list_head list;
 	struct fuse_args args;
 	struct dc_node *node, *result, *other;
+	u64 seq;
+	size_t bytes;
 	char data[];
 };
 
 struct fuse_defer {
 	struct mutex lock;
+	struct mutex replay_lock, admission_lock;
+	struct workqueue_struct *writeback_wq;
+	struct work_struct writeback_work;
+	wait_queue_head_t space_wait;
 	struct fuse_conn *fc;
 	struct list_head nodes, journal;
 	DECLARE_HASHTABLE(names, DC_HASH_BITS);
 	DECLARE_HASHTABLE(hosts, DC_HASH_BITS);
 	struct xarray ids;
 	u64 next_id;
+	u64 next_seq;
 	size_t used, limit;
+	size_t journal_bytes, blocked_bytes;
 	int alloc_error;
+	int writeback_error;
 	atomic_t pending;
 	atomic_t write_error;
-	bool initialized;
+	bool initialized, stopping;
 	ssize_t (*send)(struct fuse_chan *chan, struct fuse_args *args);
 };
 
@@ -85,10 +97,6 @@ static void *dc_alloc(struct fuse_defer *dc, size_t size)
 	struct dc_allocation *p;
 	size_t total = size + sizeof(*p);
 
-	if (total > dc->limit - dc->used) {
-		dc->alloc_error = -ENOSPC;
-		return NULL;
-	}
 	p = kvzalloc(total, GFP_NOFS);
 	if (!p) {
 		dc->alloc_error = -ENOMEM;
@@ -184,9 +192,27 @@ static struct dc_entry *dc_entry(struct fuse_defer *dc, struct dc_node *dir,
 
 static ssize_t dc_send(struct fuse_defer *dc, struct fuse_args *a)
 {
+	unsigned int nofs = memalloc_nofs_save();
+	ssize_t ret;
+
 	/* A replayed mutation must not be ambiguously interrupted after execution. */
 	a->force = true;
-	return dc->send(dc->fc->chan, a);
+	ret = dc->send(dc->fc->chan, a);
+	memalloc_nofs_restore(nofs);
+	return ret;
+}
+
+static ssize_t dc_replay_send(struct fuse_defer *dc, struct fuse_args *a)
+{
+	ssize_t ret;
+
+	/* The replay lock preserves journal order while reads use the cache lock. */
+	lockdep_assert_held(&dc->replay_lock);
+	lockdep_assert_held(&dc->lock);
+	mutex_unlock(&dc->lock);
+	ret = dc_send(dc, a);
+	mutex_lock(&dc->lock);
+	return ret;
 }
 
 static void dc_args(struct fuse_args *dst, const struct fuse_args *src,
@@ -305,7 +331,7 @@ static int dc_lookup(struct fuse_defer *dc, struct dc_node *dir,
 }
 
 static int dc_open_host(struct fuse_defer *dc, struct dc_node *n,
-			const struct fuse_args *src, u32 flags, u64 *fh)
+			const struct fuse_args *src, u32 flags, u64 *fh, bool replay)
 {
 	struct fuse_open_in in = { .flags = flags };
 	struct fuse_open_out out = {};
@@ -318,13 +344,13 @@ static int dc_open_host(struct fuse_defer *dc, struct dc_node *n,
 	a.in_args[0] = (struct fuse_in_arg){ sizeof(in), &in };
 	a.out_numargs = 1;
 	a.out_args[0] = (struct fuse_arg){ sizeof(out), &out };
-	err = dc_send(dc, &a);
+	err = replay ? dc_replay_send(dc, &a) : dc_send(dc, &a);
 	*fh = out.fh;
 	return err;
 }
 
 static void dc_close_host(struct fuse_defer *dc, struct dc_node *n,
-			  const struct fuse_args *src, u64 fh, u32 flags)
+			  const struct fuse_args *src, u64 fh, u32 flags, bool replay)
 {
 	struct fuse_release_in in = { .fh = fh, .flags = flags };
 
@@ -333,7 +359,10 @@ static void dc_close_host(struct fuse_defer *dc, struct dc_node *n,
 	dc_args(&a, src, n, S_ISDIR(n->attr.mode) ? FUSE_RELEASEDIR : FUSE_RELEASE);
 	a.in_numargs = 1;
 	a.in_args[0] = (struct fuse_in_arg){ sizeof(in), &in };
-	dc_send(dc, &a);
+	if (replay)
+		dc_replay_send(dc, &a);
+	else
+		dc_send(dc, &a);
 }
 
 static void dc_copy_pages(struct fuse_args *args, void *buffer, size_t size,
@@ -379,6 +408,7 @@ static struct dc_op *dc_save(struct fuse_defer *dc, struct fuse_args *a,
 	op->args.end = NULL;
 	op->args.out_argvar = false;
 	op->node = n;
+	op->bytes = sizeof(struct dc_allocation) + size;
 	p = op->data;
 	for (i = 0; i < a->in_numargs; i++) {
 		if (!a->in_args[i].size)
@@ -393,14 +423,35 @@ static struct dc_op *dc_save(struct fuse_defer *dc, struct fuse_args *a,
 	return op;
 }
 
+static size_t dc_high_watermark(struct fuse_defer *dc)
+{
+	return max_t(size_t, 1, dc->limit - dc->limit / 4);
+}
+
+static void dc_queue_writeback(struct fuse_defer *dc)
+{
+	if (!dc->stopping && !dc->writeback_error && !list_empty(&dc->journal))
+		queue_work(dc->writeback_wq, &dc->writeback_work);
+}
+
+static void dc_dirty(struct dc_node *n, u64 seq)
+{
+	if (n) {
+		n->dirty = true;
+		n->dirty_seq = seq;
+	}
+}
+
 static void dc_append(struct fuse_defer *dc, struct dc_op *op)
 {
+	op->seq = ++dc->next_seq;
 	list_add_tail(&op->list, &dc->journal);
-	op->node->dirty = true;
-	if (op->result)
-		op->result->dirty = true;
-	if (op->other)
-		op->other->dirty = true;
+	dc->journal_bytes += op->bytes;
+	dc_dirty(op->node, op->seq);
+	dc_dirty(op->result, op->seq);
+	dc_dirty(op->other, op->seq);
+	if (dc->journal_bytes >= dc_high_watermark(dc))
+		dc_queue_writeback(dc);
 }
 
 static void dc_touch(struct dc_node *n)
@@ -468,7 +519,7 @@ static int dc_load_dir(struct fuse_defer *dc, struct dc_node *n,
 	buffer = kvmalloc(DC_READ_SIZE, GFP_NOFS);
 	if (!buffer)
 		return -ENOMEM;
-	err = dc_open_host(dc, n, src, O_RDONLY, &fh);
+	err = dc_open_host(dc, n, src, O_RDONLY, &fh, false);
 	if (err)
 		goto free;
 	in.fh = fh;
@@ -525,7 +576,7 @@ static int dc_load_dir(struct fuse_defer *dc, struct dc_node *n,
 	if (!err)
 		n->dir_loaded = true;
 close:
-	dc_close_host(dc, n, src, fh, O_RDONLY);
+	dc_close_host(dc, n, src, fh, O_RDONLY, false);
 free:
 	kvfree(buffer);
 	return err;
@@ -864,7 +915,7 @@ static ssize_t dc_read(struct fuse_defer *dc, struct dc_node *n,
 		FUSE_ARGS(raw);
 		u64 fh;
 
-		err = dc_open_host(dc, n, a, O_RDONLY, &fh);
+		err = dc_open_host(dc, n, a, O_RDONLY, &fh, false);
 		if (err)
 			goto out;
 		in.fh = fh;
@@ -876,7 +927,7 @@ static ssize_t dc_read(struct fuse_defer *dc, struct dc_node *n,
 		raw.out_args[0] = (struct fuse_arg){ in.size, buffer };
 		raw.out_argvar = true;
 		err = dc_send(dc, &raw);
-		dc_close_host(dc, n, a, fh, O_RDONLY);
+		dc_close_host(dc, n, a, fh, O_RDONLY, false);
 		if (err < 0)
 			goto out;
 	}
@@ -1095,7 +1146,7 @@ static int dc_rename(struct fuse_defer *dc, struct dc_node *dir,
 		swap(old->node, new->node);
 		swap(old->type, new->type);
 		old->node->parent = dir->id;
-		old->node->dirty = true;
+		dc_dirty(old->node, dc->next_seq + 1);
 		dc_ctime(old->node);
 	} else {
 		if (new->present) {
@@ -1105,7 +1156,7 @@ static int dc_rename(struct fuse_defer *dc, struct dc_node *dir,
 			} else if (new->node->attr.nlink) {
 				new->node->attr.nlink--;
 			}
-			new->node->dirty = true;
+			dc_dirty(new->node, dc->next_seq + 1);
 			dc_ctime(new->node);
 		}
 		if (dir != newdir && S_ISDIR(old->node->attr.mode)) {
@@ -1167,7 +1218,7 @@ static int dc_replay_write(struct fuse_defer *dc, struct dc_op *op)
 	u64 offset = in.offset, fh;
 	int err;
 
-	err = dc_open_host(dc, op->node, &op->args, O_WRONLY, &fh);
+	err = dc_open_host(dc, op->node, &op->args, O_WRONLY, &fh, true);
 	if (err)
 		return err;
 	while (done < size) {
@@ -1183,7 +1234,7 @@ static int dc_replay_write(struct fuse_defer *dc, struct dc_op *op)
 		a.out_numargs = 1;
 		a.out_args[0] = (struct fuse_arg){ sizeof(out), &out };
 		memset(&out, 0, sizeof(out));
-		err = dc_send(dc, &a);
+		err = dc_replay_send(dc, &a);
 		if (err)
 			break;
 		if (!out.size || out.size > in.size) {
@@ -1193,7 +1244,7 @@ static int dc_replay_write(struct fuse_defer *dc, struct dc_op *op)
 		done += out.size;
 		op->node->host_size = max(op->node->host_size, offset + done);
 	}
-	dc_close_host(dc, op->node, &op->args, fh, O_WRONLY);
+	dc_close_host(dc, op->node, &op->args, fh, O_WRONLY, true);
 	return err;
 }
 
@@ -1234,7 +1285,7 @@ static int dc_replay(struct fuse_defer *dc, struct dc_op *op)
 		((struct fuse_rename_in *)a.in_args[0].value)->newdir = op->other->host;
 		break;
 	}
-	err = dc_send(dc, &a);
+	err = dc_replay_send(dc, &a);
 	if (err)
 		return err;
 	if (op->result && !op->result->host && entry.nodeid) {
@@ -1244,7 +1295,7 @@ static int dc_replay(struct fuse_defer *dc, struct dc_op *op)
 	}
 	if (opcode == FUSE_CREATE)
 		dc_close_host(dc, op->result, &a, open.fh,
-			      ((const struct fuse_create_in *)a.in_args[0].value)->flags);
+			      ((const struct fuse_create_in *)a.in_args[0].value)->flags, true);
 	if (opcode == FUSE_SETATTR) {
 		const struct fuse_setattr_in *in = a.in_args[0].value;
 
@@ -1254,19 +1305,75 @@ static int dc_replay(struct fuse_defer *dc, struct dc_op *op)
 	return 0;
 }
 
+static bool dc_has_room(struct fuse_defer *dc, size_t bytes)
+{
+	/* Admit a single oversized request, never an unbounded oversized backlog. */
+	return !dc->journal_bytes ||
+		(bytes <= dc->limit && dc->journal_bytes <= dc->limit - bytes);
+}
+
+static int dc_replay_one(struct fuse_defer *dc)
+{
+	struct dc_op *op = list_first_entry(&dc->journal, struct dc_op, list);
+	int err = dc_replay(dc, op);
+
+	if (err) {
+		dc->writeback_error = err;
+	} else {
+		list_del(&op->list);
+		dc->journal_bytes -= op->bytes;
+		dc_free(dc, op);
+	}
+	wake_up_all(&dc->space_wait);
+	return err;
+}
+
+static bool dc_needs_writeback(struct fuse_defer *dc)
+{
+	return dc->journal_bytes > dc->limit / 2 ||
+		(dc->blocked_bytes && !dc_has_room(dc, dc->blocked_bytes));
+}
+
+static void dc_writeback_work(struct work_struct *work)
+{
+	struct fuse_defer *dc = container_of(work, struct fuse_defer, writeback_work);
+	unsigned int count = 0;
+	bool again;
+	int err = 0;
+
+	mutex_lock(&dc->replay_lock);
+	mutex_lock(&dc->lock);
+	while (!dc->stopping && !dc->writeback_error &&
+	       !list_empty(&dc->journal) && dc_needs_writeback(dc)) {
+		err = dc_replay_one(dc);
+		if (err || ++count == DC_WRITEBACK_BATCH)
+			break;
+	}
+	again = !dc->stopping && !dc->writeback_error &&
+		!list_empty(&dc->journal) && dc_needs_writeback(dc);
+	if (again)
+		dc_queue_writeback(dc);
+	mutex_unlock(&dc->lock);
+	mutex_unlock(&dc->replay_lock);
+	if (err)
+		pr_warn_ratelimited("virtio-fs: deferred writeback failed: %d\n", err);
+}
+
 static int dc_commit(struct fuse_defer *dc, const struct fuse_args *src)
 {
 	struct dc_node *n;
 	struct dc_op *op;
+	u64 boundary = dc->next_seq;
 	int pass, err;
 
+	dc->writeback_error = 0;
 	while (!list_empty(&dc->journal)) {
 		op = list_first_entry(&dc->journal, struct dc_op, list);
-		err = dc_replay(dc, op);
+		if (op->seq > boundary)
+			break;
+		err = dc_replay_one(dc);
 		if (err)
 			return err;
-		list_del(&op->list);
-		dc_free(dc, op);
 	}
 	/* Flush file contents before directory metadata at the durability boundary. */
 	for (pass = 0; pass < 2; pass++) {
@@ -1281,21 +1388,23 @@ static int dc_commit(struct fuse_defer *dc, const struct fuse_args *src)
 			if (S_ISDIR(n->attr.mode) != (pass == 1))
 				continue;
 			if (!S_ISDIR(n->attr.mode) && !S_ISREG(n->attr.mode)) {
-				n->dirty = false;
+				if (n->dirty_seq <= boundary)
+					n->dirty = false;
 				continue;
 			}
-			err = dc_open_host(dc, n, src, O_RDONLY, &fh);
+			err = dc_open_host(dc, n, src, O_RDONLY, &fh, true);
 			if (err)
 				return err;
 			in.fh = fh;
 			dc_args(&a, src, n, pass ? FUSE_FSYNCDIR : FUSE_FSYNC);
 			a.in_numargs = 1;
 			a.in_args[0] = (struct fuse_in_arg){ sizeof(in), &in };
-			err = dc_send(dc, &a);
-			dc_close_host(dc, n, src, fh, O_RDONLY);
+			err = dc_replay_send(dc, &a);
+			dc_close_host(dc, n, src, fh, O_RDONLY, true);
 			if (err)
 				return err;
-			n->dirty = false;
+			if (n->dirty_seq <= boundary)
+				n->dirty = false;
 		}
 	}
 	return atomic_read(&dc->write_error);
@@ -1535,11 +1644,78 @@ static ssize_t dc_request(struct fuse_defer *dc, struct fuse_args *a)
 	}
 }
 
+static bool dc_is_checkpoint(u32 opcode)
+{
+	return opcode == FUSE_FSYNC || opcode == FUSE_FSYNCDIR ||
+		opcode == FUSE_SYNCFS || opcode == FUSE_DESTROY;
+}
+
+static size_t dc_request_bytes(struct fuse_args *a)
+{
+	size_t bytes = sizeof(struct dc_allocation) + sizeof(struct dc_op);
+	unsigned int i;
+
+	switch (a->opcode) {
+	case FUSE_OPEN:
+		if (!(((const struct fuse_open_in *)a->in_args[0].value)->flags & O_TRUNC))
+			return 0;
+		return bytes + sizeof(struct fuse_setattr_in);
+	case FUSE_CREATE:
+	case FUSE_MKNOD:
+	case FUSE_MKDIR:
+	case FUSE_SYMLINK:
+	case FUSE_UNLINK:
+	case FUSE_RMDIR:
+	case FUSE_RENAME:
+	case FUSE_RENAME2:
+	case FUSE_LINK:
+	case FUSE_SETATTR:
+	case FUSE_WRITE:
+	case FUSE_SETXATTR:
+	case FUSE_REMOVEXATTR:
+		for (i = 0; i < a->in_numargs; i++)
+			bytes += a->in_args[i].size;
+		return bytes;
+	default:
+		return 0;
+	}
+}
+
+static int dc_wait_for_space(struct fuse_defer *dc, size_t bytes)
+{
+	int err = 0;
+
+	while (!dc_has_room(dc, bytes)) {
+		size_t before = dc->journal_bytes;
+
+		if (dc->writeback_error || dc->stopping) {
+			err = dc->writeback_error ?: -ENOTCONN;
+			break;
+		}
+		/* Admission is serialized so a large request cannot starve. */
+		dc->blocked_bytes = bytes;
+		dc_queue_writeback(dc);
+		mutex_unlock(&dc->lock);
+		wait_event(dc->space_wait,
+			   READ_ONCE(dc->journal_bytes) != before ||
+			   READ_ONCE(dc->writeback_error) || READ_ONCE(dc->stopping));
+		mutex_lock(&dc->lock);
+	}
+	dc->blocked_bytes = 0;
+	return err;
+}
+
 ssize_t fuse_defer_request(struct fuse_conn *fc, struct fuse_args *args)
 {
 	struct fuse_defer *dc = fc->defer;
+	size_t bytes = dc_request_bytes(args);
+	bool checkpoint = dc_is_checkpoint(args->opcode);
 	ssize_t result;
 
+	if (checkpoint)
+		mutex_lock(&dc->replay_lock);
+	if (bytes)
+		mutex_lock(&dc->admission_lock);
 	mutex_lock(&dc->lock);
 	result = 0;
 	if (!dc->initialized) {
@@ -1549,11 +1725,17 @@ ssize_t fuse_defer_request(struct fuse_conn *fc, struct fuse_args *args)
 		if (!result)
 			dc->initialized = true;
 	}
+	if (!result && bytes)
+		result = dc_wait_for_space(dc, bytes);
 	if (!result)
 		result = dc_request(dc, args);
 	if (result < 0 && args->opcode == FUSE_WRITE)
 		atomic_cmpxchg(&dc->write_error, 0, result);
 	mutex_unlock(&dc->lock);
+	if (bytes)
+		mutex_unlock(&dc->admission_lock);
+	if (checkpoint)
+		mutex_unlock(&dc->replay_lock);
 	return result;
 }
 
@@ -1580,12 +1762,8 @@ int fuse_defer_background(struct fuse_conn *fc, struct fuse_args *args, gfp_t gf
 {
 	struct dc_work *w;
 
-	if (atomic_inc_return(&fc->defer->pending) > 256) {
-		atomic_dec(&fc->defer->pending);
-		if (args->opcode == FUSE_WRITE)
-			atomic_cmpxchg(&fc->defer->write_error, 0, -ENOMEM);
-		return -ENOMEM;
-	}
+	/* Dirty-page throttling, not a request-count cutoff, bounds writeback. */
+	atomic_inc(&fc->defer->pending);
 	w = kmalloc_obj(*w, gfp);
 	if (!w) {
 		atomic_dec(&fc->defer->pending);
@@ -1620,6 +1798,16 @@ int fuse_defer_init(struct fuse_conn *fc)
 	if (!dc)
 		return -ENOMEM;
 	mutex_init(&dc->lock);
+	mutex_init(&dc->replay_lock);
+	mutex_init(&dc->admission_lock);
+	init_waitqueue_head(&dc->space_wait);
+	INIT_WORK(&dc->writeback_work, dc_writeback_work);
+	dc->writeback_wq = alloc_workqueue("fuse-defer-writeback",
+					 WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
+	if (!dc->writeback_wq) {
+		kfree(dc);
+		return -ENOMEM;
+	}
 	dc->fc = fc;
 	dc->send = fuse_chan_send;
 	atomic_set(&dc->pending, 0);
@@ -1636,6 +1824,7 @@ int fuse_defer_init(struct fuse_conn *fc)
 		int err = dc->alloc_error;
 
 		xa_destroy(&dc->ids);
+		destroy_workqueue(dc->writeback_wq);
 		kfree(dc);
 		return err;
 	}
@@ -1653,6 +1842,12 @@ void fuse_defer_destroy(struct fuse_conn *fc)
 
 	if (!dc)
 		return;
+	mutex_lock(&dc->lock);
+	dc->stopping = true;
+	wake_up_all(&dc->space_wait);
+	mutex_unlock(&dc->lock);
+	cancel_work_sync(&dc->writeback_work);
+	destroy_workqueue(dc->writeback_wq);
 	list_for_each_entry_safe(op, next_op, &dc->journal, list)
 		dc_free(dc, op);
 	list_for_each_entry_safe(n, next, &dc->nodes, list) {
