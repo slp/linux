@@ -102,8 +102,8 @@ Deferred guest writeback (experimental)
 ---------------------------------------
 
 ``VIRTIO_FS_F_DEFERRED_WRITEBACK`` (experimental bit 2) permits a guest to buffer
-filesystem mutations locally, replay them under journal pressure, and establish
-durability at explicit checkpoints.
+filesystem mutations locally, replay them under journal pressure or as they age,
+and establish durability at explicit checkpoints.
 It is independent of ``VIRTIO_FS_F_SYNC``. Both the device and the driver must
 negotiate it; devices must not offer it by default. The libkrun filesystem API
 offers it through ``FsDevice::set_deferred_writeback(true)`` or the equivalent
@@ -161,10 +161,23 @@ transaction: host-visible changes may be partially applied on error or crash.
 
 The ``fuse.deferred_cache_mb`` parameter sets the per-mount pending-journal
 budget, in MiB (default 256). At 75% usage, a dedicated reclaim-capable worker
-starts replaying ordered batches, aiming to reduce usage to 50%. This pressure
-writeback does not issue host fsyncs or clear dirty durability state. Changes
-can therefore become host-visible before an explicit checkpoint, but durability
-is guaranteed only by a successful checkpoint.
+starts replaying ordered batches, aiming to reduce usage to 50%.
+
+A delayed worker checks pending journal entries every five seconds and replays
+entries that have been queued for at least thirty seconds, even when usage is
+below the pressure threshold. Entries are replayed in order, in bounded batches;
+younger entries remain buffered unless pressure or a checkpoint requires them.
+New mutations do not reset older entries' expiration times. The timer is armed
+only while there are pending journal entries and is cancelled during teardown.
+
+Journal age starts when an operation enters the journal. Data still in the
+guest page cache first follows normal Linux writeback timing. The journal's
+five-second check interval and thirty-second age threshold are independent of
+the ``vm.dirty_writeback_centisecs`` and ``vm.dirty_expire_centisecs`` sysctls.
+
+Neither pressure nor age-triggered writeback issues host fsyncs or clears dirty
+durability state. Changes can therefore become host-visible before an explicit
+checkpoint, but durability is guaranteed only by a successful checkpoint.
 
 When an incoming mutation would exceed the budget, its caller waits for journal
 space rather than receiving a cache-generated ``ENOSPC``. Read-only requests
@@ -187,7 +200,7 @@ If buffered data could not be retained, subsequent checkpoints continue to
 report the write error rather than claim that the data was made durable.
 
 Changes retained only in guest memory are lost on guest crash or forced teardown.
-Pressure-replayed changes are not guaranteed durable before a checkpoint.
+Background-replayed changes are not guaranteed durable before a checkpoint.
 Clean-unmount commit failures are logged, but teardown cannot preserve an
 in-memory journal.
 DAX, read-only exports, NullFs exports and context-dependent permission
@@ -197,9 +210,10 @@ or virtio-fs behavior when the feature is not negotiated.
 ``CONFIG_FUSE_DEFER_KUNIT_TEST`` builds request-level cache and replay tests.
 ``fs/fuse/defer.config`` provides a Kconfig fragment for these tests. They verify
 that repeated getattr and getxattr requests, including absent xattrs, do not
-reach the backend, and cover pressure writeback, writer admission, read-side
-progress during blocked host I/O, concurrent clean reads and mutations, retryable
-failures, concurrent checkpoints and synthetic overlay files.
+reach the backend, and cover pressure and age-triggered writeback, writer
+admission, read-side progress during blocked host I/O, concurrent clean reads
+and mutations, retryable failures, concurrent checkpoints and synthetic overlay
+files.
 
 Without ``VIRTIO_FS_F_SYNC``, the driver does not read ``num_sync_queues`` or
 initialize synchronous queues, and retains the original queue routing and

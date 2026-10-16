@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Exclusive-owner guest cache. Journal pressure may replay ordered mutations;
+/* Exclusive-owner guest cache. Journal pressure and age trigger ordered replay;
  * explicit checkpoints additionally make the replayed changes durable.
  */
 #include "dev.h"
@@ -8,6 +8,7 @@
 
 #include <linux/hashtable.h>
 #include <linux/highmem.h>
+#include <linux/jiffies.h>
 #include <linux/moduleparam.h>
 #include <linux/namei.h>
 #include <linux/sched/mm.h>
@@ -19,6 +20,8 @@
 #define DC_READ_SIZE (32 * 1024)
 #define DC_EXIT_CODE_IOCTL 0x7602
 #define DC_WRITEBACK_BATCH 32
+#define DC_WRITEBACK_INTERVAL (5 * HZ)
+#define DC_EXPIRE_INTERVAL (30 * HZ)
 
 static unsigned long deferred_cache_mb = 256;
 module_param(deferred_cache_mb, ulong, 0444);
@@ -61,6 +64,7 @@ struct dc_op {
 	struct fuse_args args;
 	struct dc_node *node, *result, *other;
 	u64 seq;
+	unsigned long expires;
 	size_t bytes;
 	char data[];
 };
@@ -70,6 +74,7 @@ struct fuse_defer {
 	struct mutex replay_lock, admission_lock;
 	struct workqueue_struct *writeback_wq;
 	struct work_struct writeback_work;
+	struct delayed_work expire_work;
 	wait_queue_head_t space_wait, read_wait;
 	struct fuse_conn *fc;
 	struct list_head nodes, journal;
@@ -447,6 +452,12 @@ static void dc_queue_writeback(struct fuse_defer *dc)
 		queue_work(dc->writeback_wq, &dc->writeback_work);
 }
 
+static void dc_queue_expiry(struct fuse_defer *dc)
+{
+	if (!dc->stopping && !dc->writeback_error && !list_empty(&dc->journal))
+		queue_delayed_work(dc->writeback_wq, &dc->expire_work, DC_WRITEBACK_INTERVAL);
+}
+
 static void dc_dirty(struct dc_node *n, u64 seq)
 {
 	if (n) {
@@ -458,6 +469,7 @@ static void dc_dirty(struct dc_node *n, u64 seq)
 static void dc_append(struct fuse_defer *dc, struct dc_op *op)
 {
 	op->seq = ++dc->next_seq;
+	op->expires = jiffies + DC_EXPIRE_INTERVAL;
 	list_add_tail(&op->list, &dc->journal);
 	if (op->args.opcode == FUSE_WRITE ||
 	    (op->args.opcode == FUSE_SETATTR &&
@@ -469,6 +481,7 @@ static void dc_append(struct fuse_defer *dc, struct dc_op *op)
 	dc_dirty(op->node, op->seq);
 	dc_dirty(op->result, op->seq);
 	dc_dirty(op->other, op->seq);
+	dc_queue_expiry(dc);
 	if (dc->journal_bytes >= dc_high_watermark(dc))
 		dc_queue_writeback(dc);
 }
@@ -1395,15 +1408,19 @@ static int dc_replay_one(struct fuse_defer *dc)
 	return err;
 }
 
-static bool dc_needs_writeback(struct fuse_defer *dc)
+static bool dc_needs_writeback(struct fuse_defer *dc, bool expired)
 {
+	if (expired) {
+		struct dc_op *op = list_first_entry(&dc->journal, struct dc_op, list);
+
+		return time_is_before_eq_jiffies(op->expires);
+	}
 	return dc->journal_bytes > dc->limit / 2 ||
 		(dc->blocked_bytes && !dc_has_room(dc, dc->blocked_bytes));
 }
 
-static void dc_writeback_work(struct work_struct *work)
+static void dc_run_writeback(struct fuse_defer *dc, bool expired)
 {
-	struct fuse_defer *dc = container_of(work, struct fuse_defer, writeback_work);
 	unsigned int count = 0;
 	bool again;
 	int err = 0;
@@ -1411,19 +1428,38 @@ static void dc_writeback_work(struct work_struct *work)
 	mutex_lock(&dc->replay_lock);
 	mutex_lock(&dc->lock);
 	while (!dc->stopping && !dc->writeback_error &&
-	       !list_empty(&dc->journal) && dc_needs_writeback(dc)) {
+	       !list_empty(&dc->journal) && dc_needs_writeback(dc, expired)) {
 		err = dc_replay_one(dc);
 		if (err || ++count == DC_WRITEBACK_BATCH)
 			break;
 	}
-	again = !dc->stopping && !dc->writeback_error &&
-		!list_empty(&dc->journal) && dc_needs_writeback(dc);
-	if (again)
-		dc_queue_writeback(dc);
+	if (!dc->stopping && !dc->writeback_error && !list_empty(&dc->journal)) {
+		again = dc_needs_writeback(dc, expired);
+		if (expired)
+			mod_delayed_work(dc->writeback_wq, &dc->expire_work,
+					 again ? 0 : DC_WRITEBACK_INTERVAL);
+		else if (again)
+			dc_queue_writeback(dc);
+	}
 	mutex_unlock(&dc->lock);
 	mutex_unlock(&dc->replay_lock);
 	if (err)
 		pr_warn_ratelimited("virtio-fs: deferred writeback failed: %d\n", err);
+}
+
+static void dc_writeback_work(struct work_struct *work)
+{
+	struct fuse_defer *dc = container_of(work, struct fuse_defer, writeback_work);
+
+	dc_run_writeback(dc, false);
+}
+
+static void dc_expire_work(struct work_struct *work)
+{
+	struct fuse_defer *dc = container_of(to_delayed_work(work),
+					     struct fuse_defer, expire_work);
+
+	dc_run_writeback(dc, true);
 }
 
 static int dc_commit(struct fuse_defer *dc, const struct fuse_args *src)
@@ -1883,6 +1919,7 @@ int fuse_defer_init(struct fuse_conn *fc)
 	init_waitqueue_head(&dc->space_wait);
 	init_waitqueue_head(&dc->read_wait);
 	INIT_WORK(&dc->writeback_work, dc_writeback_work);
+	INIT_DELAYED_WORK(&dc->expire_work, dc_expire_work);
 	dc->writeback_wq = alloc_workqueue("fuse-defer-writeback",
 					 WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
 	if (!dc->writeback_wq) {
@@ -1927,6 +1964,7 @@ void fuse_defer_destroy(struct fuse_conn *fc)
 	dc->stopping = true;
 	wake_up_all(&dc->space_wait);
 	mutex_unlock(&dc->lock);
+	cancel_delayed_work_sync(&dc->expire_work);
 	cancel_work_sync(&dc->writeback_work);
 	destroy_workqueue(dc->writeback_wq);
 	list_for_each_entry_safe(op, next_op, &dc->journal, list) {

@@ -10,7 +10,7 @@
 
 /* Synchronous request queues (bit 0 is reserved for notifications). */
 #define VIRTIO_FS_F_SYNC 1
-/* Exclusive guest caching, pressure writeback and explicit durability checkpoints. */
+/* Exclusive guest caching, background replay and explicit durability checkpoints. */
 #define VIRTIO_FS_F_DEFERRED_WRITEBACK 2
 
 struct virtio_fs_config {

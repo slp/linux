@@ -996,6 +996,119 @@ static void dc_destroy_waits_for_clean_reads(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, s->calls[FUSE_DESTROY], 1);
 }
 
+static void dc_test_age_journal(struct fuse_defer *dc, unsigned int count)
+{
+	struct dc_op *op;
+
+	mutex_lock(&dc->lock);
+	list_for_each_entry(op, &dc->journal, list) {
+		if (!count--)
+			break;
+		op->expires = jiffies - 1;
+	}
+	mutex_unlock(&dc->lock);
+}
+
+static void dc_aged_writes_drain_below_pressure(struct kunit *test)
+{
+	struct dc_test_state *s = test->priv;
+	struct fuse_defer *dc = s->fc.defer;
+	u64 id = dc_test_lookup(test, "base");
+
+	KUNIT_ASSERT_EQ(test, dc_test_write(test, id, 0, "data"), 0);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&dc->expire_work));
+	flush_delayed_work(&dc->expire_work);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_WRITE], 0);
+	KUNIT_EXPECT_GT(test, dc->journal_bytes, 0);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&dc->expire_work));
+	dc_test_age_journal(dc, UINT_MAX);
+	flush_delayed_work(&dc->expire_work);
+	KUNIT_EXPECT_TRUE(test, list_empty(&dc->journal));
+	KUNIT_EXPECT_EQ(test, dc->journal_bytes, 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_WRITE], 1);
+	KUNIT_EXPECT_MEMEQ(test, s->disk, "data", 4);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_FSYNC], 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_FSYNCDIR], 0);
+	KUNIT_EXPECT_TRUE(test, dc_node(dc, id)->dirty);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&dc->expire_work));
+	KUNIT_ASSERT_EQ(test, dc_test_commit(test, FUSE_SYNCFS), 0);
+	KUNIT_EXPECT_GT(test, s->calls[FUSE_FSYNC], 0);
+	KUNIT_EXPECT_FALSE(test, dc_node(dc, id)->dirty);
+}
+
+static void dc_aged_replay_preserves_young_tail(struct kunit *test)
+{
+	struct dc_test_state *s = test->priv;
+	struct fuse_defer *dc = s->fc.defer;
+	u64 id = dc_test_create(test, "aged");
+	char buffer[8];
+
+	KUNIT_ASSERT_EQ(test, dc_test_write(test, id, 0, "older"), 0);
+	KUNIT_ASSERT_EQ(test, dc_test_write(test, id, 0, "young"), 0);
+	dc_test_age_journal(dc, 2);
+	flush_delayed_work(&dc->expire_work);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_CREATE], 1);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_WRITE], 1);
+	KUNIT_EXPECT_MEMEQ(test, s->disk, "older", 5);
+	KUNIT_EXPECT_FALSE(test, list_empty(&dc->journal));
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&dc->expire_work));
+	KUNIT_ASSERT_EQ(test, dc_test_read(test, id, buffer, sizeof(buffer)), 5);
+	KUNIT_EXPECT_MEMEQ(test, buffer, "young", 5);
+	dc_test_age_journal(dc, UINT_MAX);
+	flush_delayed_work(&dc->expire_work);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_WRITE], 2);
+	KUNIT_EXPECT_MEMEQ(test, s->disk, "young", 5);
+	KUNIT_EXPECT_TRUE(test, list_empty(&dc->journal));
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_FSYNC], 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_FSYNCDIR], 0);
+}
+
+static void dc_aged_replay_failure_is_retryable(struct kunit *test)
+{
+	struct dc_test_state *s = test->priv;
+	struct fuse_defer *dc = s->fc.defer;
+	u64 id = dc_test_lookup(test, "base");
+	char buffer[8];
+
+	KUNIT_ASSERT_EQ(test, dc_test_write(test, id, 0, "data"), 0);
+	s->fail = FUSE_WRITE;
+	dc_test_age_journal(dc, UINT_MAX);
+	flush_delayed_work(&dc->expire_work);
+	KUNIT_EXPECT_EQ(test, dc->writeback_error, -EIO);
+	KUNIT_EXPECT_FALSE(test, list_empty(&dc->journal));
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&dc->expire_work));
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_WRITE], 1);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_FSYNC], 0);
+	KUNIT_ASSERT_EQ(test, dc_test_read(test, id, buffer, sizeof(buffer)), 4);
+	KUNIT_EXPECT_MEMEQ(test, buffer, "data", 4);
+	s->fail = 0;
+	KUNIT_ASSERT_EQ(test, dc_test_commit(test, FUSE_SYNCFS), 0);
+	KUNIT_EXPECT_EQ(test, dc->writeback_error, 0);
+	KUNIT_EXPECT_TRUE(test, list_empty(&dc->journal));
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_WRITE], 2);
+	KUNIT_EXPECT_MEMEQ(test, s->disk, "data", 4);
+}
+
+static void dc_aged_replay_continues_across_batches(struct kunit *test)
+{
+	struct dc_test_state *s = test->priv;
+	struct fuse_defer *dc = s->fc.defer;
+	u64 id = dc_test_lookup(test, "base");
+	unsigned int i;
+
+	for (i = 0; i < DC_WRITEBACK_BATCH + 5; i++)
+		KUNIT_ASSERT_EQ(test, dc_test_write(test, id, 0, "data"), 0);
+	dc_test_age_journal(dc, UINT_MAX);
+	flush_delayed_work(&dc->expire_work);
+	drain_workqueue(dc->writeback_wq);
+	KUNIT_EXPECT_TRUE(test, list_empty(&dc->journal));
+	KUNIT_EXPECT_EQ(test, dc->journal_bytes, 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_WRITE], DC_WRITEBACK_BATCH + 5);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_FSYNC], 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_FSYNCDIR], 0);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&dc->expire_work));
+}
+
 static void dc_pressure_writeback_skips_fsync(struct kunit *test)
 {
 	struct dc_test_state *s = test->priv;
@@ -1298,6 +1411,10 @@ static struct kunit_case dc_tests[] = {
 	KUNIT_CASE(dc_clean_read_revalidates_replayed_write),
 	KUNIT_CASE(dc_clean_read_revalidates_truncate),
 	KUNIT_CASE(dc_destroy_waits_for_clean_reads),
+	KUNIT_CASE(dc_aged_writes_drain_below_pressure),
+	KUNIT_CASE(dc_aged_replay_preserves_young_tail),
+	KUNIT_CASE(dc_aged_replay_failure_is_retryable),
+	KUNIT_CASE(dc_aged_replay_continues_across_batches),
 	KUNIT_CASE(dc_pressure_writeback_skips_fsync),
 	KUNIT_CASE(dc_pressure_preserves_read_side_progress),
 	KUNIT_CASE(dc_namespace_growth_does_not_exhaust_journal),
