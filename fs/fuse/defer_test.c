@@ -304,6 +304,37 @@ static ssize_t dc_test_read(struct kunit *test, u64 id, char *data, size_t size)
 	return fuse_defer_request(&s->fc, &a);
 }
 
+static int dc_test_open(struct kunit *test, u64 id)
+{
+	struct dc_test_state *s = test->priv;
+	struct fuse_open_in in = { .flags = O_RDONLY };
+	struct fuse_open_out out = {};
+
+	FUSE_ARGS(a);
+
+	a.opcode = FUSE_OPEN;
+	a.nodeid = id;
+	a.in_numargs = 1;
+	a.in_args[0] = (struct fuse_in_arg){ sizeof(in), &in };
+	a.out_numargs = 1;
+	a.out_args[0] = (struct fuse_arg){ sizeof(out), &out };
+	return fuse_defer_request(&s->fc, &a);
+}
+
+static int dc_test_release(struct kunit *test, u64 id)
+{
+	struct dc_test_state *s = test->priv;
+	struct fuse_release_in in = { .fh = id, .flags = O_RDONLY };
+
+	FUSE_ARGS(a);
+
+	a.opcode = FUSE_RELEASE;
+	a.nodeid = id;
+	a.in_numargs = 1;
+	a.in_args[0] = (struct fuse_in_arg){ sizeof(in), &in };
+	return fuse_defer_request(&s->fc, &a);
+}
+
 static int dc_test_commit(struct kunit *test, u32 opcode)
 {
 	struct dc_test_state *s = test->priv;
@@ -399,6 +430,104 @@ static void dc_symlink_uses_zero_header_layout(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, fuse_defer_request(&s->fc, &read), strlen("base/target"));
 	KUNIT_EXPECT_MEMEQ(test, buffer, "base/target", strlen("base/target"));
 	KUNIT_EXPECT_EQ(test, s->calls[FUSE_READLINK], 0);
+}
+
+static void dc_regular_reads_reuse_host_handle(struct kunit *test)
+{
+	struct dc_test_state *s = test->priv;
+	u64 id = dc_test_lookup(test, "base");
+	char buffer[4];
+
+	FUSE_ARGS(flush);
+
+	KUNIT_ASSERT_EQ(test, dc_test_open(test, id), 0);
+	KUNIT_ASSERT_EQ(test, dc_test_open(test, id), 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_OPEN], 0);
+	KUNIT_ASSERT_EQ(test, dc_test_read(test, id, buffer, sizeof(buffer)), 4);
+	KUNIT_EXPECT_MEMEQ(test, buffer, "seed", 4);
+	KUNIT_ASSERT_EQ(test, dc_test_read(test, id, buffer, sizeof(buffer)), 4);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_OPEN], 1);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_READ], 2);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_RELEASE], 0);
+	flush.opcode = FUSE_FLUSH;
+	flush.nodeid = id;
+	KUNIT_ASSERT_EQ(test, fuse_defer_request(&s->fc, &flush), 0);
+	KUNIT_ASSERT_EQ(test, dc_test_release(test, id), 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_RELEASE], 0);
+	KUNIT_ASSERT_EQ(test, dc_test_read(test, id, buffer, sizeof(buffer)), 4);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_OPEN], 1);
+	KUNIT_ASSERT_EQ(test, dc_test_release(test, id), 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_RELEASE], 1);
+	KUNIT_ASSERT_EQ(test, dc_test_open(test, id), 0);
+	KUNIT_ASSERT_EQ(test, dc_test_read(test, id, buffer, sizeof(buffer)), 4);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_OPEN], 2);
+	KUNIT_ASSERT_EQ(test, dc_test_release(test, id), 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_RELEASE], 2);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_FSYNC], 0);
+}
+
+static void dc_read_handle_errors_are_retryable(struct kunit *test)
+{
+	struct dc_test_state *s = test->priv;
+	u64 id = dc_test_lookup(test, "base");
+	char buffer[4];
+
+	KUNIT_ASSERT_EQ(test, dc_test_open(test, id), 0);
+	s->fail = FUSE_OPEN;
+	KUNIT_ASSERT_EQ(test, dc_test_read(test, id, buffer, sizeof(buffer)), -EIO);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_OPEN], 1);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_READ], 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_RELEASE], 0);
+	s->fail = FUSE_READ;
+	KUNIT_ASSERT_EQ(test, dc_test_read(test, id, buffer, sizeof(buffer)), -EIO);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_OPEN], 2);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_RELEASE], 0);
+	s->fail = 0;
+	KUNIT_ASSERT_EQ(test, dc_test_read(test, id, buffer, sizeof(buffer)), 4);
+	KUNIT_EXPECT_MEMEQ(test, buffer, "seed", 4);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_OPEN], 2);
+	KUNIT_ASSERT_EQ(test, dc_test_release(test, id), 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_RELEASE], 1);
+}
+
+static void dc_created_file_tracks_read_handle(struct kunit *test)
+{
+	struct dc_test_state *s = test->priv;
+	u64 id = dc_test_create(test, "local");
+	u32 opens, releases;
+	char buffer[4];
+
+	KUNIT_ASSERT_EQ(test, dc_test_write(test, id, 0, "data"), 0);
+	KUNIT_ASSERT_EQ(test, dc_test_read(test, id, buffer, sizeof(buffer)), 4);
+	KUNIT_EXPECT_MEMEQ(test, buffer, "data", 4);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_CREATE], 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_OPEN], 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_READ], 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_WRITE], 0);
+	KUNIT_ASSERT_EQ(test, dc_test_commit(test, FUSE_SYNCFS), 0);
+	opens = s->calls[FUSE_OPEN];
+	releases = s->calls[FUSE_RELEASE];
+	KUNIT_ASSERT_EQ(test, dc_test_read(test, id, buffer, sizeof(buffer)), 4);
+	KUNIT_ASSERT_EQ(test, dc_test_read(test, id, buffer, sizeof(buffer)), 4);
+	KUNIT_EXPECT_MEMEQ(test, buffer, "data", 4);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_OPEN], opens + 1);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_RELEASE], releases);
+	KUNIT_ASSERT_EQ(test, dc_test_release(test, id), 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_RELEASE], releases + 1);
+}
+
+static void dc_destroy_closes_read_handles(struct kunit *test)
+{
+	struct dc_test_state *s = test->priv;
+	u64 id = dc_test_lookup(test, "base");
+	char buffer[4];
+
+	KUNIT_ASSERT_EQ(test, dc_test_open(test, id), 0);
+	KUNIT_ASSERT_EQ(test, dc_test_read(test, id, buffer, sizeof(buffer)), 4);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_RELEASE], 0);
+	KUNIT_ASSERT_EQ(test, dc_test_commit(test, FUSE_DESTROY), 0);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_RELEASE], 1);
+	KUNIT_EXPECT_EQ(test, s->calls[FUSE_DESTROY], 1);
 }
 
 static void dc_server_owned_open_lifecycle(struct kunit *test)
@@ -959,6 +1088,10 @@ static struct kunit_case dc_tests[] = {
 	KUNIT_CASE(dc_cached_attributes),
 	KUNIT_CASE(dc_lookup_uses_counted_names),
 	KUNIT_CASE(dc_symlink_uses_zero_header_layout),
+	KUNIT_CASE(dc_regular_reads_reuse_host_handle),
+	KUNIT_CASE(dc_read_handle_errors_are_retryable),
+	KUNIT_CASE(dc_created_file_tracks_read_handle),
+	KUNIT_CASE(dc_destroy_closes_read_handles),
 	KUNIT_CASE(dc_server_owned_open_lifecycle),
 	KUNIT_CASE(dc_server_owned_page_reads),
 	KUNIT_CASE(dc_lookup_only_entries_survive_cached_readdir),

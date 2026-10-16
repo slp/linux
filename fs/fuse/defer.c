@@ -28,10 +28,11 @@ struct dc_node {
 	struct list_head list;
 	struct hlist_node host_hash;
 	u64 id, host, host_size, parent;
+	u64 read_fh, open_count;
 	u64 dirty_seq;
 	struct fuse_attr attr;
 	bool attr_valid, dir_loaded, xattrs_loaded, dirty;
-	bool server_owned, volatile_name;
+	bool server_owned, volatile_name, read_open;
 	u64 cookie;
 	struct list_head children, xattrs;
 	char *symlink;
@@ -363,6 +364,15 @@ static void dc_close_host(struct fuse_defer *dc, struct dc_node *n,
 		dc_replay_send(dc, &a);
 	else
 		dc_send(dc, &a);
+}
+
+static void dc_close_read(struct fuse_defer *dc, struct dc_node *n,
+			  const struct fuse_args *src)
+{
+	if (!n->read_open)
+		return;
+	dc_close_host(dc, n, src, n->read_fh, O_RDONLY, false);
+	n->read_open = false;
 }
 
 static void dc_copy_pages(struct fuse_args *args, void *buffer, size_t size,
@@ -915,9 +925,17 @@ static ssize_t dc_read(struct fuse_defer *dc, struct dc_node *n,
 		FUSE_ARGS(raw);
 		u64 fh;
 
-		err = dc_open_host(dc, n, a, O_RDONLY, &fh, false);
-		if (err)
-			goto out;
+		if (n->read_open) {
+			fh = n->read_fh;
+		} else {
+			err = dc_open_host(dc, n, a, O_RDONLY, &fh, false);
+			if (err)
+				goto out;
+			if (n->open_count) {
+				n->read_fh = fh;
+				n->read_open = true;
+			}
+		}
 		in.fh = fh;
 		in.size = min_t(u64, size, n->host_size - in.offset);
 		dc_args(&raw, a, n, FUSE_READ);
@@ -927,7 +945,8 @@ static ssize_t dc_read(struct fuse_defer *dc, struct dc_node *n,
 		raw.out_args[0] = (struct fuse_arg){ in.size, buffer };
 		raw.out_argvar = true;
 		err = dc_send(dc, &raw);
-		dc_close_host(dc, n, a, fh, O_RDONLY, false);
+		if (!n->read_open)
+			dc_close_host(dc, n, a, fh, O_RDONLY, false);
 		if (err < 0)
 			goto out;
 	}
@@ -1035,6 +1054,7 @@ static int dc_create(struct fuse_defer *dc, struct dc_node *dir,
 	if (a->opcode == FUSE_CREATE) {
 		struct fuse_open_out *out = a->out_args[1].value;
 
+		n->open_count++;
 		*out = (struct fuse_open_out){ .fh = n->id, .open_flags = FOPEN_KEEP_CACHE };
 	}
 	return 0;
@@ -1485,13 +1505,19 @@ static ssize_t dc_request(struct fuse_defer *dc, struct fuse_args *a)
 		err = dc_commit(dc, a);
 		if (err || a->opcode != FUSE_DESTROY)
 			return err;
+		list_for_each_entry(n, &dc->nodes, list)
+			dc_close_read(dc, n, a);
 		return dc_send(dc, a);
 	}
 	if (n && n->server_owned && a->opcode != FUSE_LOOKUP &&
 	    a->opcode != FUSE_IOCTL && a->opcode != FUSE_STATFS)
 		return dc_server_request(dc, n, a);
-	if (a->opcode == FUSE_FLUSH || a->opcode == FUSE_RELEASE ||
-	    a->opcode == FUSE_RELEASEDIR)
+	if (a->opcode == FUSE_RELEASE) {
+		if (n && n->open_count && !--n->open_count)
+			dc_close_read(dc, n, a);
+		return 0;
+	}
+	if (a->opcode == FUSE_FLUSH || a->opcode == FUSE_RELEASEDIR)
 		return 0;
 	if (!n)
 		return -ESTALE;
@@ -1542,6 +1568,8 @@ static ssize_t dc_request(struct fuse_defer *dc, struct fuse_args *a)
 			dc_append(dc, op);
 		}
 
+		if (a->opcode == FUSE_OPEN)
+			n->open_count++;
 		*out = (struct fuse_open_out){ .fh = n->id,
 			.open_flags = FOPEN_KEEP_CACHE | (a->opcode == FUSE_OPENDIR ? FOPEN_CACHE_DIR : 0) };
 		return 0;

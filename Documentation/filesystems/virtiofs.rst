@@ -115,6 +115,10 @@ not supported. Cached attributes and positive and negative name and xattr
 lookups are authoritative until unmount. Local mutations update these cached
 results without revalidating them on the host. Cached directory contents and
 symlink targets are also retained. Cold reads can still require host requests.
+Ordinary files lazily acquire a host read handle on the first cold read and
+reuse it until the last guest open is released. Reading an uncached input
+archive therefore still produces host reads, without reopening and closing the
+host file for each read. Open and close alone do not checkpoint mutations.
 
 Synthetic read-only entries, such as libkrun's ``FsOverlay``/``AugmentFs`` files
 ``/init.krun`` and ``/.krun_config.json``, remain server-owned. When the feature
